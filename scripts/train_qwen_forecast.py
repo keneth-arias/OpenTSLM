@@ -17,7 +17,8 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from opentslm.forecast import MODEL_REVISION, PersistenceForecaster, QwenForecaster
 from opentslm.forecast_checkpoint import point_to, publish, read_manifest, recover, sha256
-from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict, set_state_dict
+from opentslm.forecast_inference import add_lora, forecast, forecast_batches, read_data, state_options
+from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
@@ -39,6 +40,12 @@ def arguments():
     p.add_argument("--save-seconds", type=int, default=900)
     p.add_argument("--min-free-gib", type=int, default=12)
     p.add_argument("--validation", type=Path)
+    p.add_argument(
+        "--validate-at",
+        choices=("checkpoint", "final"),
+        default="checkpoint",
+        help="Validate at each save or only at the final scheduled update",
+    )
     p.add_argument("--resume", action="store_true")
     p.add_argument("--lora", action="store_true")
     args = p.parse_args()
@@ -47,51 +54,6 @@ def arguments():
     if args.lora and args.mode == "fsdp":
         p.error("Use the single or ddp mode for LoRA")
     return args
-
-
-def read_data(path):
-    with np.load(path, allow_pickle=False) as data:
-        ids = data["window_id"]
-        history = torch.from_numpy(data["history"]).float().unsqueeze(-1)
-        target = torch.from_numpy(data["targets"]).float().unsqueeze(-1)
-    if (
-        history.shape != (len(ids), 24, 1)
-        or target.shape != (len(ids), 6, 1)
-        or len(np.unique(ids)) != len(ids)
-        or not history.isfinite().all()
-        or not target.isfinite().all()
-    ):
-        raise ValueError("Expected unique, finite 24/6 forecast windows")
-    return ids, history, target
-
-
-def add_lora(model):
-    from peft import LoraConfig, inject_adapter_in_model
-
-    targets = [
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "in_proj_qkv",
-        "in_proj_z",
-        "in_proj_a",
-        "in_proj_b",
-        "out_proj",
-    ]
-    model.decoder = inject_adapter_in_model(LoraConfig(r=4, lora_alpha=8, target_modules=targets), model.decoder)
-    names = [name for name, _ in model.decoder.named_parameters() if ".lora_B." in name]
-    expected = {
-        index: 4 if kind == "full_attention" else 5 for index, kind in enumerate(model.decoder.config.layer_types)
-    }
-    for index, count in expected.items():
-        if sum(name.startswith(f"layers.{index}.") for name in names) != count:
-            raise RuntimeError(f"Unexpected LoRA coverage in decoder layer {index}")
-    return names
-
-
-def state_options(lora):
-    return StateDictOptions(ignore_frozen_params=lora, strict=not lora)
 
 
 def checkpoint_state(model, optimizer, lora):
@@ -171,16 +133,6 @@ def restore(root, model, optimizer, scheduler, args, identity, rank):
     return step, metadata["best_mae"]
 
 
-def forecast(model, history, args):
-    center = history.mean(dim=1, keepdim=True)
-    scale = history.std(dim=1, correction=0, keepdim=True)
-    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    normalized = (history - center) / scale
-    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.precision == "bf16"):
-        predicted = model(normalized, torch.ones_like(history, dtype=torch.bool))
-    return predicted.float(), center, scale
-
-
 @torch.no_grad()
 def validation(model, data, args, rank, world, device):
     # Every rank must execute the same number of FSDP gathers. Pad only the
@@ -189,15 +141,11 @@ def validation(model, data, args, rank, world, device):
     absolute = torch.zeros(6, dtype=torch.float64, device=device)
     persistence = torch.zeros_like(absolute)
     model.eval()
-    for start in range(0, len(ids), args.batch):
-        index = torch.arange(start + rank, start + args.batch, world)
-        valid = index < len(ids)
-        index = index.clamp_max(len(ids) - 1)
-        x = history[index].to(device)
+    for index, predicted in forecast_batches(model, history, args, rank, world, device):
         y = target[index].to(device)
-        p, center, scale = forecast(model, x, args)
-        absolute += (p * scale + center - y).abs()[valid].sum(dim=(0, 2))
-        persistence += (x[:, -1:] - y).abs()[valid].sum(dim=(0, 2))
+        absolute += (predicted - y).abs().sum(dim=(0, 2), dtype=torch.float64)
+        last = history[index, -1:].to(device)
+        persistence += (last - y).abs().sum(dim=(0, 2), dtype=torch.float64)
     dist.all_reduce(absolute)
     dist.all_reduce(persistence)
     model.train()
@@ -233,6 +181,8 @@ def train(args, rank, world, device):
         "trainer": os.environ.get("FORECAST_SOURCE_REVISION", sha256(Path(__file__))),
         "weights": sha256(args.weights.parent / "SHA256SUMS"),
     }
+    if args.validate_at != "checkpoint":
+        identity["validate_at"] = args.validate_at
     if rank == 0 and not args.resume and list(args.run_dir.glob("step-????????")):
         raise FileExistsError("Choose a new run directory or resume")
     torch.manual_seed(args.seed)
@@ -323,7 +273,8 @@ def train(args, rank, world, device):
             dist.all_reduce(disk_ok, op=dist.ReduceOp.MIN)
             if not disk_ok.item():
                 raise OSError("Insufficient free space for a new checkpoint generation")
-            metrics = validation(model, evaluation, args, rank, world, device) if evaluation else {}
+            evaluate_now = evaluation is not None and (args.validate_at == "checkpoint" or step == args.schedule_steps)
+            metrics = validation(model, evaluation, args, rank, world, device) if evaluate_now else {}
             if rank == 0 and metrics:
                 print(json.dumps({"step": step, **metrics}), flush=True)
             metric = metrics.get("mae")

@@ -60,3 +60,28 @@ def test_future_changes_loss_but_not_prediction():
         results.append(smoke_step(model, history, mask, torch.full((1, 6, 2), target)))
     assert results[0]["prediction_before_step"] == results[1]["prediction_before_step"]
     assert results[0]["mse"] != results[1]["mse"]
+
+
+def test_persistence_initialization_and_two_step_training():
+    from opentslm.forecast import PersistenceForecaster
+
+    torch.manual_seed(27)
+    model = PersistenceForecaster(tiny_model().decoder)
+    history = torch.randn(2, 24, 1)
+    history[0, -1] = 0
+    observed = torch.ones_like(history, dtype=torch.bool)
+    reference = history[:, -1:].expand(-1, 6, -1)
+    assert torch.equal(model(history, observed), reference)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0)
+    probe = model.decoder.layers[0].mlp.down_proj.weight
+    initial = probe.detach().clone()
+    for step in range(2):
+        optimizer.zero_grad()
+        loss = (model(history, observed) - (reference + 1)).square().mean()
+        loss.backward()
+        optimizer.step()
+        assert torch.equal(initial, probe) == (step == 0)
+        assert model.head.weight.count_nonzero() > 0
+    observed[1, -1] = False
+    with pytest.raises(ValueError, match="origin"):
+        model(history, observed)

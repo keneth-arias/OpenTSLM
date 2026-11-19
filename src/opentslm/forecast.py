@@ -27,10 +27,10 @@ class QwenForecaster(nn.Module):
         self.head = nn.Linear(width, horizon * targets)
 
     @classmethod
-    def from_pretrained(cls, *, local_files_only=False, **dimensions):
+    def from_pretrained(cls, *, local_files_only=False, checkpoint_path=None, **dimensions):
         checkpoint, report = Qwen3_5ForConditionalGeneration.from_pretrained(
-            MODEL_ID,
-            revision=MODEL_REVISION,
+            checkpoint_path or MODEL_ID,
+            revision=None if checkpoint_path else MODEL_REVISION,
             local_files_only=local_files_only,
             dtype=torch.float32,
             output_loading_info=True,

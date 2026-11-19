@@ -56,6 +56,21 @@ class QwenForecaster(nn.Module):
         return self.head(state[:, -1]).reshape(batch, self.horizon, self.targets)
 
 
+class PersistenceForecaster(QwenForecaster):
+    """Univariate forecasts anchored to the observed value at the forecast origin."""
+
+    def __init__(self, decoder: Qwen3_5TextModel, *, horizon=6, patch_size=4):
+        super().__init__(decoder, horizon=horizon, patch_size=patch_size)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, history: Tensor, observed: Tensor) -> Tensor:
+        correction = super().forward(history, observed)
+        if not observed[:, -1].all() or not history[:, -1].isfinite().all():
+            raise ValueError("Persistence requires a finite observed value at the origin")
+        return history[:, -1:] + correction
+
+
 def smoke_step(model: QwenForecaster, history: Tensor, observed: Tensor, targets: Tensor) -> dict:
     """Run one FP32 AdamW step and check an update in both trainable components."""
     model.train()

@@ -113,6 +113,8 @@ for i, batch in enumerate(test_loader):
 
 ## Building and finetuning your own models
 
+For numerical forecasts with Qwen3.5-0.8B, follow the [isolated forecasting setup](environments/forecast/README.md).
+
 To run the demos and use finetuning scripts **clone the repository** and set up all dependencies. We recommend using [uv](https://docs.astral.sh/uv/) to set up the environment, but you can also use pip:
 
 ```bash

@@ -16,3 +16,10 @@ def test_recover_ignores_incomplete_and_damaged_generations(tmp_path):
     (tmp_path / "step-00000004" / "state").write_bytes(b"wrong")
     assert recover(tmp_path, identity)[0] == 2
     assert recover(tmp_path, {"seed": 13}) is None
+
+    staging = tmp_path / ".replacement"
+    staging.mkdir()
+    (staging / "state").write_bytes(b"new shard")
+    publish(tmp_path, staging, 4, identity)
+    assert recover(tmp_path, identity)[0] == 4
+    assert len(list(tmp_path.glob(".damaged-*"))) == 1

@@ -16,8 +16,8 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from opentslm.forecast import MODEL_REVISION, PersistenceForecaster, QwenForecaster
-from opentslm.forecast_checkpoint import point_to, publish, recover, sha256
-from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+from opentslm.forecast_checkpoint import point_to, publish, read_manifest, recover, sha256
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict, set_state_dict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
@@ -40,9 +40,12 @@ def arguments():
     p.add_argument("--min-free-gib", type=int, default=12)
     p.add_argument("--validation", type=Path)
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--lora", action="store_true")
     args = p.parse_args()
     if not 0 < args.stop_step <= args.schedule_steps or args.save_seconds < 0:
         p.error("Invalid stopping step, schedule or save interval")
+    if args.lora and args.mode == "fsdp":
+        p.error("Use the single or ddp mode for LoRA")
     return args
 
 
@@ -62,8 +65,37 @@ def read_data(path):
     return ids, history, target
 
 
-def checkpoint_state(model, optimizer):
-    params, optim = get_state_dict(model, optimizer)
+def add_lora(model):
+    from peft import LoraConfig, inject_adapter_in_model
+
+    targets = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "in_proj_qkv",
+        "in_proj_z",
+        "in_proj_a",
+        "in_proj_b",
+        "out_proj",
+    ]
+    model.decoder = inject_adapter_in_model(LoraConfig(r=4, lora_alpha=8, target_modules=targets), model.decoder)
+    names = [name for name, _ in model.decoder.named_parameters() if ".lora_B." in name]
+    expected = {
+        index: 4 if kind == "full_attention" else 5 for index, kind in enumerate(model.decoder.config.layer_types)
+    }
+    for index, count in expected.items():
+        if sum(name.startswith(f"layers.{index}.") for name in names) != count:
+            raise RuntimeError(f"Unexpected LoRA coverage in decoder layer {index}")
+    return names
+
+
+def state_options(lora):
+    return StateDictOptions(ignore_frozen_params=lora, strict=not lora)
+
+
+def checkpoint_state(model, optimizer, lora):
+    params, optim = get_state_dict(model, optimizer, options=state_options(lora))
     return {"model": params, "optimizer": optim}
 
 
@@ -72,7 +104,7 @@ def save(root, model, optimizer, scheduler, step, identity, rank, best_mae, metr
     staging = [tempfile.mkdtemp(prefix=".saving-", dir=root) if rank == 0 else None]
     dist.broadcast_object_list(staging)
     staging = Path(staging[0])
-    dcp.save(checkpoint_state(model, optimizer), checkpoint_id=staging / "dcp")
+    dcp.save(checkpoint_state(model, optimizer, identity["lora"]), checkpoint_id=staging / "dcp")
     torch.save(
         {"cpu": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state()},
         staging / f"rng-{rank}.pt",
@@ -89,13 +121,15 @@ def save(root, model, optimizer, scheduler, step, identity, rank, best_mae, metr
         if (root / "best").exists():
             protected.add((root / "best").read_text().strip())
         # Rotate only our own published generations, after the new one is visible.
-        candidates = sorted(root.glob("step-????????"), reverse=True)
+        candidates = [
+            path
+            for path in sorted(root.glob("step-????????"), reverse=True)
+            if (info := read_manifest(path)) and info["identity"] == identity
+        ]
         protected.update(p.name for p in candidates[:2])
         for path in candidates:
             if path.name not in protected:
-                info = json.loads((path / "manifest.json").read_text())
-                if info["identity"] == identity:
-                    shutil.rmtree(path)
+                shutil.rmtree(path)
         print(
             json.dumps(
                 {
@@ -118,9 +152,15 @@ def restore(root, model, optimizer, scheduler, args, identity, rank):
             raise ValueError("No complete compatible checkpoint")
         return 0, None
     step, path = selected[0]
-    state = checkpoint_state(model, optimizer)
+    state = checkpoint_state(model, optimizer, identity["lora"])
     dcp.load(state, checkpoint_id=path / "dcp")
-    set_state_dict(model, optimizer, model_state_dict=state["model"], optim_state_dict=state["optimizer"])
+    set_state_dict(
+        model,
+        optimizer,
+        model_state_dict=state["model"],
+        optim_state_dict=state["optimizer"],
+        options=state_options(identity["lora"]),
+    )
     metadata = json.loads((path / "training.pt.json").read_text())
     scheduler.load_state_dict(metadata["scheduler"])
     rng = torch.load(path / f"rng-{rank}.pt", map_location="cpu", weights_only=True)
@@ -187,6 +227,7 @@ def train(args, rank, world, device):
         "precision": args.precision,
         "world": world,
         "mode": args.mode,
+        "lora": args.lora,
         "seed": args.seed,
         "torch": str(torch.__version__),
         "trainer": os.environ.get("FORECAST_SOURCE_REVISION", sha256(Path(__file__))),
@@ -199,6 +240,9 @@ def train(args, rank, world, device):
     model = forecaster.from_pretrained(checkpoint_path=str(args.weights), local_files_only=True)
     # The embedding table is unused with numerical soft prompts.
     model.decoder.get_input_embeddings().requires_grad_(False)
+    adapters = add_lora(model) if args.lora else []
+    if adapters and rank == 0:
+        print(json.dumps({"adapter_modules": adapters}), flush=True)
     model = model.to(device)
     if args.mode == "fsdp":
         mesh = init_device_mesh("cuda", (world,))
@@ -211,7 +255,7 @@ def train(args, rank, world, device):
     core = model
     if args.mode == "ddp":
         model = DistributedDataParallel(model, device_ids=[device.index])
-    probe = core.decoder.layers[0].mlp.down_proj.weight
+    probe = core.decoder.get_parameter(adapters[0]) if adapters else core.decoder.layers[0].mlp.down_proj.weight
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=1e-4, weight_decay=0, foreach=False
     )

@@ -31,6 +31,9 @@ from torch.nn.parallel import DistributedDataParallel
 LEGACY_TRAINER_SHA256 = "4a17f9f4a9efc393767cfa0d42d89bd29165bae9794bcefa0e4bf1006e6dd9db"
 
 
+PREVIOUS_TRAINER_SHA256 = "88beb175c7c0e4dec8480d9cd1d9fd10b5b2619cad6d377ef1337f73ecc0642e"
+
+
 def arguments():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data", required=True, type=Path)
@@ -52,6 +55,7 @@ def arguments():
         default="checkpoint",
         help="Validate at each save or only at the final scheduled update",
     )
+    p.add_argument("--matched-point",action="store_true",help="Fit the one-GPU direct control on the same full epoch as the candidate heads")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--lora", action="store_true")
     p.add_argument("--input-manifest", type=Path)
@@ -62,7 +66,9 @@ def arguments():
     p.add_argument("--scaler", type=Path)
     p.add_argument("--input-view", choices=("first", "both"))
     args = p.parse_args()
-    if args.head in ("quantile", "episode"):
+    if args.matched_point and args.head!="direct":
+        p.error("--matched-point requires the direct head")
+    if args.matched_point or args.head in ("quantile", "episode"):
         if args.mode != "single" or args.input_view:
             p.error("Candidate heads require single-worker univariate training")
         args.lora = True
@@ -136,12 +142,16 @@ def save(root, model, optimizer, scheduler, step, identity, rank, best_mae, metr
 
 def resume_generation(root, identity, pinned_source):
     generation = recover(root, identity)
-    if generation is None and "task_schema" not in identity and not pinned_source:
-        previous = {**identity, "trainer": LEGACY_TRAINER_SHA256}
-        generation = recover(root, previous)
+    if generation is not None or pinned_source or "matched_point" in identity:
+        return generation, identity["trainer"]
+    compatible = [PREVIOUS_TRAINER_SHA256]
+    if "task_schema" not in identity:
+        compatible.append(LEGACY_TRAINER_SHA256)
+    for revision in compatible:
+        generation = recover(root, {**identity, "trainer": revision})
         if generation is not None:
-            return generation, previous["trainer"]
-    return generation, identity["trainer"]
+            return generation, revision
+    return None, identity["trainer"]
 
 
 def restore(root, model, optimizer, scheduler, args, identity, rank):
@@ -224,13 +234,25 @@ def validation(model, data, args, rank, world, device):
     }
 
 
+def epoch_batches(rows, batch, *, include_partial):
+    return math.ceil(rows / batch) if include_partial else rows // batch
+
+
+def epoch_order(ids, args, epoch):
+    include_partial = bool(args.joint or args.task_schema or args.matched_point)
+    batches = epoch_batches(len(ids), args.batch, include_partial=include_partial)
+    order = torch.randperm(len(ids), generator=torch.Generator().manual_seed(args.seed + epoch))
+    return order[:batches * args.batch]
+
+
 def train(args, rank, world, device):
-    if args.task_schema:
+    if args.task_schema or args.matched_point:
         verify_candidate_input(args.data, args.input_manifest, args.input_manifest_sha256, "fit", args.head, args.thresholds_sha256)
         if args.validation:
             verify_candidate_input(args.validation, args.validation_manifest, args.validation_manifest_sha256, "inner_validation", args.head, args.thresholds_sha256)
     ids, history, targets, thresholds = read_task_data(args.data, args.joint, args.head, args.thresholds_sha256)
-    batches = math.ceil(len(ids) / args.batch) if args.joint or args.task_schema else len(ids) // args.batch
+    window_order = epoch_order(ids,args,0)
+    batches = math.ceil(len(window_order) / args.batch)
     if batches < 1:
         raise ValueError("One complete training batch is required")
     evaluation = read_task_data(args.validation, args.joint, args.head, args.thresholds_sha256) if args.validation else None
@@ -254,6 +276,9 @@ def train(args, rank, world, device):
     }
     if args.task_schema:
         identity.update(task_schema=args.task_schema, input_manifest_sha256=args.input_manifest_sha256,
+                        validation_manifest_sha256=args.validation_manifest_sha256)
+    if args.matched_point:
+        identity.update(matched_point="complete_epoch_v1", input_manifest_sha256=args.input_manifest_sha256,
                         validation_manifest_sha256=args.validation_manifest_sha256)
     if args.validate_at != "checkpoint":
         identity["validate_at"] = args.validate_at
@@ -296,13 +321,14 @@ def train(args, rank, world, device):
     step, best = restore(args.run_dir, model, optimizer, scheduler, args, identity, rank)
     if not step < args.stop_step:
         raise ValueError("Stopping step must advance the restored run")
-    window_order = None
+    current_epoch = 0
     saved_at = time.monotonic()
     for cursor in range(step, args.stop_step):
         epoch, position = divmod(cursor, batches)
-        if position == 0 or window_order is None:
-            window_order = torch.randperm(len(ids), generator=torch.Generator().manual_seed(args.seed + epoch))
-        indices = window_order[position * args.batch : (position + 1) * args.batch]
+        if current_epoch != epoch:
+            window_order = epoch_order(ids,args,epoch)
+            current_epoch = epoch
+        indices = window_order[position * args.batch:(position + 1) * args.batch]
         subset = indices[rank::world]
         x, y = history[subset].to(device), targets[subset].to(device)
         torch.cuda.synchronize()

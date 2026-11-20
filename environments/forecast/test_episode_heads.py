@@ -228,3 +228,101 @@ def test_interval_validation_includes_last_partial_batch(monkeypatch):
     result = trainer["validation"](Fixed(), data, args, 0, 1, "cpu")
     assert result["coverage_by_horizon"] == pytest.approx([2 / 3] * 6)
     assert result["width_by_horizon"] == [2.0] * 6 and result["crossed_by_horizon"] == [0] * 6
+
+
+@pytest.mark.parametrize("count,expected", [(5, 2), (1, 1), (4, 1)])
+def test_matched_point_uses_final_partial_batch_without_changing_legacy(count, expected):
+    from pathlib import Path
+    from runpy import run_path
+
+    train = run_path(str(Path(__file__).resolve().parents[2] / "scripts/train_qwen_forecast.py"))
+    assert train["epoch_batches"](count, 4, include_partial=True) == expected
+    assert train["epoch_batches"](count, 4, include_partial=False) == count // 4
+
+
+@pytest.mark.parametrize("head", ["direct", "quantile", "episode", "persistence"])
+def test_previous_unpinned_checkpoint_resumes_only_with_same_recipe(tmp_path, head):
+    from pathlib import Path
+    from runpy import run_path
+
+    from opentslm.forecast_checkpoint import publish
+    from opentslm.forecast_inference import task_schema
+
+    train = run_path(str(Path(__file__).resolve().parents[2] / "scripts/train_qwen_forecast.py"))
+    prior = {"head": head, "trainer": train["PREVIOUS_TRAINER_SHA256"], "seed": 27}
+    if head in ("episode", "quantile"):
+        prior["task_schema"] = task_schema(head, "a" * 64)
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    (stage / "weights").write_bytes(b"fixture")
+    final, _ = publish(tmp_path, stage, 4, prior)
+    now = {**prior, "trainer": "current"}
+    resume = train["resume_generation"]
+    assert resume(tmp_path, now, False) == ((4, final), prior["trainer"])
+    assert resume(tmp_path, {**now, "matched_point": "complete_epoch_v1"}, False)[0] is None
+    assert resume(tmp_path, {**now, "seed": 28}, False)[0] is None
+    assert resume(tmp_path, now, True)[0] is None
+
+
+def test_direct_and_quantile_cli_visit_identical_window_ids(monkeypatch, tmp_path):
+    import sys
+    from pathlib import Path
+    from runpy import run_path
+
+    train = run_path(str(Path(__file__).resolve().parents[2] / "scripts/train_qwen_forecast.py"))
+    ids = np.array(["e", "b", "a", "c", "d"])
+    base = [
+        "train",
+        "--mode",
+        "single",
+        "--batch",
+        "4",
+        "--data",
+        str(tmp_path / "data.npz"),
+        "--weights",
+        str(tmp_path / "weights"),
+        "--run-dir",
+        str(tmp_path / "run"),
+        "--stop-step",
+        "2",
+        "--schedule-steps",
+        "2",
+    ]
+    schedules = {}
+    for head in ("direct", "quantile", "legacy"):
+        opt = ["--head", "quantile"] if head == "quantile" else ["--matched-point"] if head == "direct" else []
+        monkeypatch.setattr(sys, "argv", base + opt)
+        args = train["arguments"]()
+        schedules[head] = [[ids[idx.numpy()].tolist() for idx in train["epoch_order"](ids, args, e).split(args.batch)] for e in (0, 1)]
+        if head != "legacy":
+            assert args.lora and args.validate_at == "final"
+    assert schedules["direct"] == schedules["quantile"]
+    for epoch, legacy in zip(schedules["direct"], schedules["legacy"], strict=True):
+        assert [len(batch) for batch in epoch] == [4, 1]
+        assert sorted(epoch[0] + epoch[1]) == sorted(ids) and epoch[:1] == legacy
+
+@pytest.mark.parametrize(("mode", "head", "message"), [
+    ("single", "quantile", "requires the direct head"),
+    ("fsdp", "direct", "require single-worker"),
+])
+def test_matched_point_rejects_incompatible_cli(monkeypatch, capsys, mode, head, message):
+    import sys
+    from pathlib import Path
+    from runpy import run_path
+
+    train = run_path(str(Path(__file__).resolve().parents[2] / "scripts/train_qwen_forecast.py"))
+    monkeypatch.setattr(sys, "argv", [
+        "train", "--mode", mode, "--head", head, "--matched-point",
+        "--data", "train.npz", "--weights", "weights", "--run-dir", "out",
+        "--stop-step", "1", "--schedule-steps", "1",
+    ])
+    with pytest.raises(SystemExit) as error:
+        train["arguments"]()
+    assert error.value.code == 2 and message in capsys.readouterr().err
+
+
+def test_matched_point_requires_a_pinned_training_manifest(tmp_path):
+    from opentslm.forecast_inference import verify_candidate_input
+
+    with pytest.raises(ValueError, match="pinned candidate input manifest"):
+        verify_candidate_input(tmp_path / "train.npz", None, None, "fit", "direct", None)

@@ -52,6 +52,7 @@ def arguments():
         default="checkpoint",
         help="Validate at each save or only at the final scheduled update",
     )
+    p.add_argument("--matched-point",action="store_true",help="Fit the one-GPU direct control on the same full epoch as the candidate heads")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--lora", action="store_true")
     p.add_argument("--input-manifest", type=Path)
@@ -62,7 +63,9 @@ def arguments():
     p.add_argument("--scaler", type=Path)
     p.add_argument("--input-view", choices=("first", "both"))
     args = p.parse_args()
-    if args.head in ("quantile", "episode"):
+    if args.matched_point and args.head!="direct":
+        p.error("--matched-point requires the direct head")
+    if args.matched_point or args.head in ("quantile", "episode"):
         if args.mode != "single" or args.input_view:
             p.error("Candidate heads require single-worker univariate training")
         args.lora = True
@@ -224,13 +227,17 @@ def validation(model, data, args, rank, world, device):
     }
 
 
+def epoch_batches(rows, batch, *, include_partial):
+    return math.ceil(rows / batch) if include_partial else rows // batch
+
+
 def train(args, rank, world, device):
-    if args.task_schema:
+    if args.task_schema or args.matched_point:
         verify_candidate_input(args.data, args.input_manifest, args.input_manifest_sha256, "fit", args.head, args.thresholds_sha256)
         if args.validation:
             verify_candidate_input(args.validation, args.validation_manifest, args.validation_manifest_sha256, "inner_validation", args.head, args.thresholds_sha256)
     ids, history, targets, thresholds = read_task_data(args.data, args.joint, args.head, args.thresholds_sha256)
-    batches = math.ceil(len(ids) / args.batch) if args.joint or args.task_schema else len(ids) // args.batch
+    batches = epoch_batches(len(ids), args.batch, include_partial=bool(args.joint or args.task_schema or args.matched_point))
     if batches < 1:
         raise ValueError("One complete training batch is required")
     evaluation = read_task_data(args.validation, args.joint, args.head, args.thresholds_sha256) if args.validation else None
@@ -254,6 +261,9 @@ def train(args, rank, world, device):
     }
     if args.task_schema:
         identity.update(task_schema=args.task_schema, input_manifest_sha256=args.input_manifest_sha256,
+                        validation_manifest_sha256=args.validation_manifest_sha256)
+    if args.matched_point:
+        identity.update(matched_point="complete_epoch_v1", input_manifest_sha256=args.input_manifest_sha256,
                         validation_manifest_sha256=args.validation_manifest_sha256)
     if args.validate_at != "checkpoint":
         identity["validate_at"] = args.validate_at

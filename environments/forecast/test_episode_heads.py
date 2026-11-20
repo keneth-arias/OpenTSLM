@@ -228,3 +228,13 @@ def test_interval_validation_includes_last_partial_batch(monkeypatch):
     result = trainer["validation"](Fixed(), data, args, 0, 1, "cpu")
     assert result["coverage_by_horizon"] == pytest.approx([2 / 3] * 6)
     assert result["width_by_horizon"] == [2.0] * 6 and result["crossed_by_horizon"] == [0] * 6
+
+
+@pytest.mark.parametrize("count,expected", [(5, 2), (1, 1), (4, 1)])
+def test_matched_point_uses_final_partial_batch_without_changing_legacy(count, expected):
+    from pathlib import Path
+    from runpy import run_path
+
+    train = run_path(str(Path(__file__).resolve().parents[2] / "scripts/train_qwen_forecast.py"))
+    assert train["epoch_batches"](count, 4, include_partial=True) == expected
+    assert train["epoch_batches"](count, 4, include_partial=False) == count // 4

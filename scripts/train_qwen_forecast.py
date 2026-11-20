@@ -17,9 +17,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from opentslm.forecast import MODEL_REVISION, PersistenceForecaster, QwenForecaster
+from opentslm.forecast import FORECASTERS, MODEL_REVISION, task_loss
 from opentslm.forecast_checkpoint import point_to, publish, read_manifest, recover, sha256
-from opentslm.forecast_inference import JointInputs, add_lora, forecast, forecast_batches, read_data, state_options
+from opentslm.forecast_inference import JointInputs, add_lora, forecast, forecast_batches, read_task_data, state_options, task_schema
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
@@ -36,7 +36,7 @@ def arguments():
     p.add_argument("--schedule-steps", required=True, type=int)
     p.add_argument("--batch", type=int, default=4, help="Global batch size")
     p.add_argument("--mode", choices=("single", "ddp", "fsdp"), default="fsdp")
-    p.add_argument("--head", choices=("direct", "persistence"), default="direct")
+    p.add_argument("--head", choices=tuple(FORECASTERS), default="direct")
     p.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
     p.add_argument("--seed", type=int, default=27)
     p.add_argument("--save-seconds", type=int, default=900)
@@ -50,9 +50,18 @@ def arguments():
     )
     p.add_argument("--resume", action="store_true")
     p.add_argument("--lora", action="store_true")
+    p.add_argument("--thresholds-sha256", help="Frozen threshold manifest SHA-256 for episode fits")
     p.add_argument("--scaler", type=Path)
     p.add_argument("--input-view", choices=("first", "both"))
     args = p.parse_args()
+    if args.head in ("quantile", "episode"):
+        if args.mode != "single" or args.input_view:
+            p.error("Candidate heads require single-worker univariate training")
+        args.lora = True
+        args.validate_at = "final"
+    if args.thresholds_sha256 and args.head != "episode":
+        p.error("Only the episode head uses station thresholds")
+    args.task_schema = task_schema(args.head, args.thresholds_sha256)
     if bool(args.input_view) != bool(args.scaler):
         p.error("Supply both input view and fitted scaler")
     if args.scaler and (args.mode != "single" or args.head != "direct"):
@@ -146,12 +155,21 @@ def restore(root, model, optimizer, scheduler, args, identity, rank):
 def validation(model, data, args, rank, world, device):
     # Every rank must execute the same number of FSDP gathers. Pad only the
     # final batch and discard those padding rows from metric reductions.
-    ids, history, target = data
+    ids, history, target, thresholds = data
+    if args.head == "episode":
+        model.eval()
+        squared = torch.zeros((), dtype=torch.float64, device=device)
+        for index, logit in forecast_batches(model, history, args, rank, world, device, thresholds):
+            squared += (logit.sigmoid() - target[index].to(device)).square().sum(dtype=torch.float64)
+        model.train()
+        return {"validation_windows": len(ids), "brier_uncalibrated": squared.item() / len(ids)}
     absolute = torch.zeros((6, target.shape[-1]), dtype=torch.float64, device=device)
     persistence = torch.zeros_like(absolute)
     model.eval()
     for index, predicted in forecast_batches(model, history, args, rank, world, device):
         y = target[index].to(device)
+        if args.head == "quantile":
+            predicted = predicted[:, :, 1:2]
         absolute += (predicted - y).abs().sum(dim=0, dtype=torch.float64)
         if args.joint is None:
             last = history[index, -1:].to(device)
@@ -171,11 +189,11 @@ def validation(model, data, args, rank, world, device):
 
 
 def train(args, rank, world, device):
-    ids, history, targets = read_data(args.data, args.joint)
-    batches = math.ceil(len(ids) / args.batch) if args.joint else len(ids) // args.batch
+    ids, history, targets, thresholds = read_task_data(args.data, args.joint, args.head, args.thresholds_sha256)
+    batches = math.ceil(len(ids) / args.batch) if args.joint or args.task_schema else len(ids) // args.batch
     if batches < 1:
         raise ValueError("One complete training batch is required")
-    evaluation = read_data(args.validation, args.joint) if args.validation else None
+    evaluation = read_task_data(args.validation, args.joint, args.head, args.thresholds_sha256) if args.validation else None
     if evaluation is not None and (not len(evaluation[0]) or np.intersect1d(ids, evaluation[0]).size):
         raise ValueError("Validation must be nonempty and disjoint from training")
     identity = {
@@ -194,12 +212,14 @@ def train(args, rank, world, device):
         "trainer": os.environ.get("FORECAST_SOURCE_REVISION", sha256(Path(__file__))),
         "weights": sha256(args.weights.parent / "SHA256SUMS"),
     }
+    if args.task_schema:
+        identity["task_schema"] = args.task_schema
     if args.validate_at != "checkpoint":
         identity["validate_at"] = args.validate_at
     if rank == 0 and not args.resume and list(args.run_dir.glob("step-????????")):
         raise FileExistsError("Choose a new run directory or resume")
     torch.manual_seed(args.seed)
-    forecaster = PersistenceForecaster if args.head == "persistence" else QwenForecaster
+    forecaster = FORECASTERS[args.head]
     dimensions = {"channels": 2, "targets": 2} if args.joint else {}
     model = forecaster.from_pretrained(checkpoint_path=str(args.weights), local_files_only=True, **dimensions)
     # The embedding table is unused with numerical soft prompts.
@@ -247,8 +267,9 @@ def train(args, rank, world, device):
         torch.cuda.synchronize()
         started = time.monotonic()
         optimizer.zero_grad(set_to_none=True)
-        prediction, center, scale = forecast(model, x, args)
-        loss = torch.nn.functional.mse_loss(prediction, (y - center) / scale)
+        context = thresholds[subset].to(device) if thresholds is not None else None
+        prediction, center, scale = forecast(model, x, args, context)
+        loss = task_loss(args.head, prediction, y, center, scale)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True, foreach=False)
         optimizer.step()
@@ -299,7 +320,7 @@ def train(args, rank, world, device):
             metrics = validation(model, evaluation, args, rank, world, device) if evaluate_now else {}
             if rank == 0 and metrics:
                 print(json.dumps({"step": step, **metrics}), flush=True)
-            metric = metrics.get("mae")
+            metric = metrics.get("brier_uncalibrated" if args.head == "episode" else "mae")
             if metric is not None:
                 best = metric if best is None else min(best, metric)
             save(args.run_dir, model, optimizer, scheduler, step, identity, rank, best, metric)

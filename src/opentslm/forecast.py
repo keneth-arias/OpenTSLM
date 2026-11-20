@@ -39,7 +39,7 @@ class QwenForecaster(nn.Module):
             raise ValueError("Incomplete Qwen checkpoint")
         return cls(checkpoint.model.language_model, **dimensions)
 
-    def forward(self, history: Tensor, observed: Tensor) -> Tensor:
+    def encode(self, history: Tensor, observed: Tensor) -> Tensor:
         """Use only historical values and their availability mask, both shaped [B,T,C]."""
         if history.ndim != 3 or history.shape[-1] != self.channels:
             raise ValueError("Expected history with shape [batch, time, channels]")
@@ -53,7 +53,10 @@ class QwenForecaster(nn.Module):
         tokens = self.project(patches.reshape(batch, hours // self.patch_size, -1))
         tokens = torch.cat((tokens, self.readout.expand(batch, -1, -1)), dim=1)
         state = self.decoder(inputs_embeds=tokens, use_cache=False).last_hidden_state
-        return self.head(state[:, -1]).reshape(batch, self.horizon, self.targets)
+        return state[:, -1]
+
+    def forward(self, history: Tensor, observed: Tensor) -> Tensor:
+        return self.head(self.encode(history, observed)).reshape(len(history), self.horizon, self.targets)
 
 
 class PersistenceForecaster(QwenForecaster):
@@ -69,6 +72,52 @@ class PersistenceForecaster(QwenForecaster):
         if not observed[:, -1].all() or not history[:, -1].isfinite().all():
             raise ValueError("Persistence requires a finite observed value at the origin")
         return history[:, -1:] + correction
+
+
+QUANTILES = (0.1, 0.5, 0.9)
+
+
+class QuantileForecaster(QwenForecaster):
+    """Median plus two nonnegative distances, one interval per horizon."""
+
+    def __init__(self, decoder):
+        super().__init__(decoder, targets=3)
+
+    def forward(self, history, observed):
+        left, median, right = super().forward(history, observed).unbind(dim=-1)
+        return torch.stack((median - nn.functional.softplus(left), median, median + nn.functional.softplus(right)), dim=-1)
+
+
+class EpisodeForecaster(QwenForecaster):
+    """One raw logit for a threshold crossing anywhere in the six-hour horizon."""
+
+    def __init__(self, decoder):
+        super().__init__(decoder)
+        self.head = nn.Linear(decoder.config.hidden_size + 1, 1)
+
+    def forward(self, history, observed, normalized_threshold):
+        state = self.encode(history, observed)
+        features = torch.cat((state, normalized_threshold.reshape(len(history), 1)), dim=-1)
+        return self.head(features).squeeze(-1)
+
+
+FORECASTERS = {
+    "direct": QwenForecaster,
+    "persistence": PersistenceForecaster,
+    "quantile": QuantileForecaster,
+    "episode": EpisodeForecaster,
+}
+
+
+def task_loss(head, predicted, target, center, scale):
+    if head == "episode":
+        return nn.functional.binary_cross_entropy_with_logits(predicted, target)
+    normalized = (target - center) / scale
+    if head == "quantile":
+        residual = normalized - predicted
+        levels = predicted.new_tensor(QUANTILES)
+        return torch.maximum(levels * residual, (levels - 1) * residual).mean()
+    return nn.functional.mse_loss(predicted, normalized)
 
 
 def smoke_step(model: QwenForecaster, history: Tensor, observed: Tensor, targets: Tensor) -> dict:

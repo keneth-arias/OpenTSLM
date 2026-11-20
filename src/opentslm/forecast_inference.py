@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +18,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, set_model_state_dict
 
-from opentslm.forecast import MODEL_REVISION, PersistenceForecaster, QwenForecaster
+from opentslm.forecast import FORECASTERS, MODEL_REVISION, QUANTILES
 from opentslm.forecast_checkpoint import files, read_manifest, sha256
 
 
@@ -67,9 +68,11 @@ class JointInputs:
         }
 
 
-def read_history(data, joint=None, *, require_history_only=False):
+def read_history(data, joint=None, *, require_history_only=False, episode=False):
     if require_history_only:
         fields = {"window_id", "history", "channels"} if joint else {"window_id", "history"}
+        if episode:
+            fields.update(("threshold_ug_m3", "thresholds_sha256"))
         if set(data) != fields:
             raise ValueError(f"Expected a history-only archive with fields {sorted(fields)}")
     ids = data["window_id"]
@@ -106,6 +109,43 @@ def read_data(path, joint=None):
     return ids, history, target
 
 
+def task_schema(head, threshold_hash=None):
+    if head not in ("quantile", "episode"):
+        return None
+    schema = {"version": 1, "head": head, "horizon": 6, "lora_rank": 4, "lora_alpha": 8}
+    if head == "episode":
+        if not isinstance(threshold_hash, str) or not re.fullmatch("[0-9a-f]{64}", threshold_hash):
+            raise ValueError("Expected a frozen threshold manifest SHA-256")
+        schema.update(target="any_ge_h1_h6_v1", thresholds_sha256=threshold_hash)
+    else:
+        schema["levels"] = list(QUANTILES)
+    return schema
+
+
+def episode_thresholds(data, ids, expected_hash):
+    if str(data["thresholds_sha256"].item()) != expected_hash:
+        raise ValueError("Mismatched threshold manifest")
+    values = torch.from_numpy(data["threshold_ug_m3"]).float()
+    if values.shape != (len(ids),) or not values.isfinite().all():
+        raise ValueError("Expected one finite PM2.5 threshold per window")
+    return values
+
+
+def read_task_data(path, joint, head, threshold_hash):
+    if head != "episode":
+        return (*read_data(path, joint), None)
+    with np.load(path, allow_pickle=False) as data:
+        ids, history = read_history(data)
+        thresholds = episode_thresholds(data, ids, threshold_hash)
+        event = data["event"]
+        if event.shape != (len(ids),) or event.dtype.kind not in "biuf" or not np.isin(event, (-1, 0, 1)).all():
+            raise ValueError("Expected one 0/1 event label or -1 for ineligible windows")
+        valid = event != -1
+        if not valid.any():
+            raise ValueError("No eligible episode labels")
+        return ids[valid], history[valid], torch.from_numpy(event[valid]).float(), thresholds[valid]
+
+
 def add_lora(model):
     from peft import LoraConfig, inject_adapter_in_model
 
@@ -135,7 +175,7 @@ def state_options(lora):
     return StateDictOptions(ignore_frozen_params=lora, strict=not lora)
 
 
-def forecast(model, history, args):
+def forecast(model, history, args, thresholds=None):
     joint = getattr(args, "joint", None)
     observed = torch.ones_like(history, dtype=torch.bool)
     if joint is None:
@@ -150,19 +190,27 @@ def forecast(model, history, args):
             observed[:, :, 1] = False
         normalized = (torch.where(observed, history, center) - center) / scale
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.precision == "bf16"):
-        predicted = model(normalized, observed)
+        if getattr(args, "head", None) == "episode":
+            context = (thresholds - center.flatten()) / scale.flatten()
+            predicted = model(normalized, observed, context)
+        else:
+            predicted = model(normalized, observed)
     return predicted.float(), center, scale
 
 
 @torch.no_grad()
-def forecast_batches(model, history, args, rank, world, device):
+def forecast_batches(model, history, args, rank, world, device, thresholds=None):
     """All ranks run equally sized batches, including the padded final collective."""
     for start in range(0, len(history), args.batch):
         index = torch.arange(start + rank, start + args.batch, world)
         valid = index < len(history)
-        x = history[index.clamp_max(len(history) - 1)].to(device)
-        forecast_value, center, scale = forecast(model, x, args)
-        yield index[valid], (forecast_value * scale + center)[valid]
+        rows = index.clamp_max(len(history) - 1)
+        x = history[rows].to(device)
+        context = thresholds[rows].to(device) if thresholds is not None else None
+        value, center, scale = forecast(model, x, args, context)
+        if getattr(args, "head", None) != "episode":
+            value = value * scale + center
+        yield index[valid], value[valid]
 
 
 def load_checkpoint_model(model, checkpoint, lora):
@@ -173,22 +221,38 @@ def load_checkpoint_model(model, checkpoint, lora):
     set_model_state_dict(model, state["model"], options=options)
 
 
-def write_predictions(path, ids, shards, checkpoint_sha256=None, joint=None):
+def write_predictions(path, ids, shards, checkpoint_sha256=None, joint=None, *, head="direct",
+                      input_sha256=None, thresholds_sha256=None):
     indices = np.concatenate([idx for idx, _ in shards])
     values = np.concatenate([pred for _, pred in shards])
     order = indices.argsort()
-    if (
-        not np.array_equal(indices[order], np.arange(len(ids)))
-        or values.shape != (len(ids), 6, 2 if joint else 1)
-        or not np.isfinite(values).all()
-    ):
-        raise ValueError("Expected one finite six-hour prediction per input window")
+    values = values[order]
+    shape = (len(ids), 6, 2 if joint else 1)
+    if head == "episode":
+        shape = (len(ids),)
+    elif head == "quantile":
+        shape = (len(ids), 6, 3)
+    if not np.array_equal(indices[order], np.arange(len(ids))) or values.shape != shape or not np.isfinite(values).all():
+        raise ValueError("Expected one finite task output per input window")
+    payload = {"window_id": ids}
+    if checkpoint_sha256:
+        payload["checkpoint_sha256"] = checkpoint_sha256
+    if head in ("episode", "quantile"):
+        payload.update(task=head, input_sha256=input_sha256, schema_version=1)
+    if head == "episode":
+        payload.update(episode_logit=values, thresholds_sha256=thresholds_sha256)
+    else:
+        payload["forecast_hour"] = np.arange(1, 7)
+        if head == "quantile":
+            if (np.diff(values, axis=-1) < 0).any():
+                raise ValueError("Crossed forecast quantiles")
+            payload.update(quantiles=values, levels=np.asarray(QUANTILES), predicted=values[:, :, 1])
+        else:
+            payload["predicted"] = values if joint else values[:, :, 0]
+    if joint:
+        payload.update(channels=np.asarray(joint.channels), view=joint.view, scaler_sha256=joint.digest)
     with NamedTemporaryFile(dir=path.parent) as tmp:
-        provenance = {"checkpoint_sha256": checkpoint_sha256} if checkpoint_sha256 else {}
-        if joint:
-            provenance.update(channels=np.asarray(joint.channels), view=joint.view, scaler_sha256=joint.digest)
-        predicted = values[order] if joint else values[order, :, 0]
-        np.savez(tmp, window_id=ids, forecast_hour=np.arange(1, 7), predicted=predicted, **provenance)
+        np.savez(tmp, **payload)
         tmp.flush()
         os.link(tmp.name, path)
 
@@ -202,6 +266,8 @@ def main():
     parser.add_argument("--batch", type=int, default=32, help="Global inference batch size")
     parser.add_argument("--input-view", choices=("first", "both"))
     parser.add_argument("--scaler", type=Path)
+    parser.add_argument("--head", choices=tuple(FORECASTERS), help="Required for versioned candidate outputs")
+    parser.add_argument("--thresholds-sha256", help="Frozen threshold manifest for episode inference")
     parser.add_argument(
         "--require-history-only", action="store_true", help="Reject fields outside the history input schema"
     )
@@ -215,8 +281,13 @@ def main():
         parser.error("Global batch must be a positive multiple of the inference world size")
     if args.output.exists():
         raise FileExistsError(args.output)
+    schema = task_schema(args.head, args.thresholds_sha256)
+    if (schema and args.joint) or (args.thresholds_sha256 and args.head != "episode"):
+        parser.error("Candidate heads use univariate inputs; only episodes use thresholds")
     with np.load(args.data, allow_pickle=False) as data:
-        ids, history = read_history(data, args.joint, require_history_only=args.require_history_only)
+        ids, history = read_history(data, args.joint, require_history_only=args.require_history_only or bool(schema),
+                                    episode=args.head == "episode")
+        thresholds = episode_thresholds(data, ids, args.thresholds_sha256) if args.head == "episode" else None
     device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
     torch.cuda.set_device(device)
     if world > 1:
@@ -228,8 +299,13 @@ def main():
         identity = manifest["identity"]
         if identity.get("joint") != (args.joint.identity() if args.joint else None):
             raise ValueError("Checkpoint input view, channels or fitted scaler mismatch")
-        if identity["model"] != MODEL_REVISION or identity["head"] not in {"direct", "persistence"}:
+        if identity["model"] != MODEL_REVISION or identity["head"] not in FORECASTERS:
             raise ValueError("Incompatible forecast checkpoint")
+        if identity.get("task_schema") != schema or (args.head and identity["head"] != args.head):
+            raise ValueError("Checkpoint task schema or threshold manifest mismatch")
+        if identity["head"] in ("quantile", "episode") and schema is None:
+            raise ValueError("Versioned checkpoints require the matching task schema")
+        args.head = identity["head"]
         if identity["precision"] not in {"fp32", "bf16"}:
             raise ValueError("Unsupported forecast precision")
         sums = args.weights.parent / "SHA256SUMS"
@@ -243,7 +319,7 @@ def main():
             subprocess.run(["sha256sum", "--strict", "--check", sums.name], cwd=sums.parent, check=True)
         if world > 1:
             dist.barrier()
-        forecaster = PersistenceForecaster if identity["head"] == "persistence" else QwenForecaster
+        forecaster = FORECASTERS[args.head]
         dimensions = {"channels": 2, "targets": 2} if args.joint else {}
         model = forecaster.from_pretrained(checkpoint_path=str(args.weights), local_files_only=True, **dimensions)
         if identity["lora"]:
@@ -252,7 +328,7 @@ def main():
         model.to(device).eval()
         args.precision = identity["precision"]
         indices, values = [], []
-        for idx, prediction in forecast_batches(model, history, args, rank, world, device):
+        for idx, prediction in forecast_batches(model, history, args, rank, world, device, thresholds):
             indices.append(idx.numpy())
             values.append(prediction.cpu().numpy())
         shard = (np.concatenate(indices), np.concatenate(values))
@@ -262,7 +338,9 @@ def main():
             dist.gather_object(shard, shards, dst=0)
         if rank == 0:
             digest = sha256(args.checkpoint / "manifest.json")
-            write_predictions(args.output, ids, shards, digest, args.joint)
+            write_predictions(args.output, ids, shards, digest, args.joint, head=args.head,
+                              input_sha256=sha256(args.data) if schema else None,
+                              thresholds_sha256=args.thresholds_sha256)
             print(json.dumps({"windows": len(ids), "checkpoint_sha256": digest, "output_sha256": sha256(args.output)}))
     finally:
         if world > 1:

@@ -44,3 +44,11 @@ The fitted JSON scaler records the input version, ordered channels, population m
 positive scales for training. The first-input view masks the second channel before scaling.
 Both variants emit both targets in the original units and train on the final partial batch.
 Restoration checks the scaler and input view recorded in the checkpoint manifest.
+
+## Six-hour candidate heads
+
+Use `scripts/train_qwen_forecast.py --mode single --head quantile` or `--head episode` with the usual training arguments. Both candidates use rank-4 LoRA, alpha 8 and the fixed final update for evaluation. The quantile task uses the univariate H24/F6 training archive and emits ordered q10, q50 and q90 for each forecast hour. The point estimate is the median.
+
+An episode fit reads `window_id`, `history`, `threshold_ug_m3[N]`, a scalar `thresholds_sha256`, and one `event[N]` label (0, 1, or −1 for ineligible). Pass the frozen table digest with `--thresholds-sha256` for fit, resume and inference. Each station threshold is supplied in raw units and uses the same transform as its window. Use only eligible labels from the data owner. The history-only inference archive omits `event`; the episode output contains one raw `episode_logit` per ID. Calibration is a separate AirAware step.
+
+For inference repeat the selected `--head` with the usual checkpoint, base weights, input and output paths. A versioned checkpoint records task definition, levels or threshold-table digest, and adapter configuration. A legacy point checkpoint keeps its original identity.

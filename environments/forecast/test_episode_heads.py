@@ -242,8 +242,9 @@ def test_matched_point_uses_final_partial_batch_without_changing_legacy(count, e
 
 @pytest.mark.parametrize("head", ["direct", "quantile", "episode", "persistence"])
 def test_previous_unpinned_checkpoint_resumes_only_with_same_recipe(tmp_path, head):
-    from runpy import run_path
     from pathlib import Path
+    from runpy import run_path
+
     from opentslm.forecast_checkpoint import publish
     from opentslm.forecast_inference import task_schema
 
@@ -264,9 +265,9 @@ def test_previous_unpinned_checkpoint_resumes_only_with_same_recipe(tmp_path, he
 
 
 def test_direct_and_quantile_cli_visit_identical_window_ids(monkeypatch, tmp_path):
-    from runpy import run_path
-    from pathlib import Path
     import sys
+    from pathlib import Path
+    from runpy import run_path
 
     train = run_path(str(Path(__file__).resolve().parents[2] / "scripts/train_qwen_forecast.py"))
     ids = np.array(["e", "b", "a", "c", "d"])
@@ -299,3 +300,29 @@ def test_direct_and_quantile_cli_visit_identical_window_ids(monkeypatch, tmp_pat
     for epoch, legacy in zip(schedules["direct"], schedules["legacy"], strict=True):
         assert [len(batch) for batch in epoch] == [4, 1]
         assert sorted(epoch[0] + epoch[1]) == sorted(ids) and epoch[:1] == legacy
+
+@pytest.mark.parametrize(("mode", "head", "message"), [
+    ("single", "quantile", "requires the direct head"),
+    ("fsdp", "direct", "require single-worker"),
+])
+def test_matched_point_rejects_incompatible_cli(monkeypatch, capsys, mode, head, message):
+    import sys
+    from pathlib import Path
+    from runpy import run_path
+
+    train = run_path(str(Path(__file__).resolve().parents[2] / "scripts/train_qwen_forecast.py"))
+    monkeypatch.setattr(sys, "argv", [
+        "train", "--mode", mode, "--head", head, "--matched-point",
+        "--data", "train.npz", "--weights", "weights", "--run-dir", "out",
+        "--stop-step", "1", "--schedule-steps", "1",
+    ])
+    with pytest.raises(SystemExit) as error:
+        train["arguments"]()
+    assert error.value.code == 2 and message in capsys.readouterr().err
+
+
+def test_matched_point_requires_a_pinned_training_manifest(tmp_path):
+    from opentslm.forecast_inference import verify_candidate_input
+
+    with pytest.raises(ValueError, match="pinned candidate input manifest"):
+        verify_candidate_input(tmp_path / "train.npz", None, None, "fit", "direct", None)

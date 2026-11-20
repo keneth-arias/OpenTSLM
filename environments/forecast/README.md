@@ -31,3 +31,12 @@ PYTHONPATH=src python -m opentslm.forecast_inference \
 ```
 
 For two GPUs use `torchrun --standalone --nproc-per-node=2 --module opentslm.forecast_inference` with the same arguments. The input requires window IDs and a finite 24-hour history. The NPZ output carries the input order, forecast hours 1 through 6, predictions in original units and the checkpoint manifest SHA-256. Targets are only needed when independently scoring the export. Each output path can be published once.
+
+For matched two-channel regression, supply `--input-view first` or `--input-view both`
+and `--scaler PATH` to the single-worker direct trainer and to checkpoint inference.
+The training archive contains `history[N,24,2]`, `targets[N,6,2]`, ordered
+`channels` and `window_id`. Inference only requires the histories, channel names and IDs.
+The fitted JSON scaler records the input version, ordered channels, population means and
+positive scales for training. The first-input view masks the second channel before scaling.
+Both variants emit both targets in the original units and train on the final partial batch.
+Restoration checks the scaler and input view recorded in the checkpoint manifest.

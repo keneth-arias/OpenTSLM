@@ -3,9 +3,11 @@
 """Restore numerical forecast checkpoints and export predictions in original units."""
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -19,11 +21,66 @@ from opentslm.forecast import MODEL_REVISION, PersistenceForecaster, QwenForecas
 from opentslm.forecast_checkpoint import files, read_manifest, sha256
 
 
-def read_history(data):
+@dataclass(frozen=True)
+class JointInputs:
+    channels: tuple
+    view: str
+    mean: tuple
+    scale: tuple
+    version: str
+    digest: str
+
+    @classmethod
+    def load(cls, path, view):
+        raw = path.read_bytes()
+        scaler = json.loads(raw)
+        channels = tuple(scaler["channels"])
+        mean, scale = (np.asarray(scaler[k], dtype=np.float64) for k in ("mean", "scale"))
+        if (
+            view not in {"first", "both"}
+            or len(channels) != 2
+            or len(set(channels)) != 2
+            or mean.shape != (2,)
+            or scale.shape != (2,)
+            or not np.isfinite(mean).all()
+            or not np.isfinite(scale).all()
+            or not (scale > 0).all()
+        ):
+            raise ValueError("Invalid two-channel scaler or input view")
+        return cls(
+            channels,
+            view,
+            tuple(mean.tolist()),
+            tuple(scale.tolist()),
+            scaler["version"],
+            hashlib.sha256(raw).hexdigest(),
+        )
+
+    def identity(self):
+        return {
+            "view": self.view,
+            "channels": list(self.channels),
+            "targets": list(self.channels),
+            "horizon": 6,
+            "version": self.version,
+            "scaler_sha256": self.digest,
+        }
+
+
+def read_history(data, joint=None):
     ids = data["window_id"]
-    history = torch.from_numpy(data["history"]).float().unsqueeze(-1)
+    raw = data["history"]
+    if joint:
+        if tuple(data["channels"].tolist()) != joint.channels or raw.shape != (len(ids), 24, 2):
+            raise ValueError("Mismatched input channels or dimensions")
+        if joint.view == "first":
+            raw = raw.copy()
+            raw[:, :, 1] = 0
+    else:
+        raw = raw[..., None]
+    history = torch.from_numpy(raw).float()
     if (
-        history.shape != (len(ids), 24, 1)
+        history.shape != (len(ids), 24, 2 if joint else 1)
         or ids.ndim != 1
         or ids.dtype.kind not in "Uifu"
         or not len(ids)
@@ -34,11 +91,13 @@ def read_history(data):
     return ids, history
 
 
-def read_data(path):
+def read_data(path, joint=None):
     with np.load(path, allow_pickle=False) as data:
-        ids, history = read_history(data)
-        target = torch.from_numpy(data["targets"]).float().unsqueeze(-1)
-    if target.shape != (len(ids), 6, 1) or not target.isfinite().all():
+        ids, history = read_history(data, joint)
+        target = torch.from_numpy(data["targets"]).float()
+        if joint is None:
+            target = target.unsqueeze(-1)
+    if target.shape != (len(ids), 6, 2 if joint else 1) or not target.isfinite().all():
         raise ValueError("Expected six finite targets per window")
     return ids, history, target
 
@@ -73,12 +132,21 @@ def state_options(lora):
 
 
 def forecast(model, history, args):
-    center = history.mean(dim=1, keepdim=True)
-    scale = history.std(dim=1, correction=0, keepdim=True)
-    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
-    normalized = (history - center) / scale
+    joint = getattr(args, "joint", None)
+    observed = torch.ones_like(history, dtype=torch.bool)
+    if joint is None:
+        center = history.mean(dim=1, keepdim=True)
+        scale = history.std(dim=1, correction=0, keepdim=True)
+        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+        normalized = (history - center) / scale
+    else:
+        center = history.new_tensor(joint.mean)
+        scale = history.new_tensor(joint.scale)
+        if joint.view == "first":
+            observed[:, :, 1] = False
+        normalized = (torch.where(observed, history, center) - center) / scale
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.precision == "bf16"):
-        predicted = model(normalized, torch.ones_like(history, dtype=torch.bool))
+        predicted = model(normalized, observed)
     return predicted.float(), center, scale
 
 
@@ -101,19 +169,22 @@ def load_checkpoint_model(model, checkpoint, lora):
     set_model_state_dict(model, state["model"], options=options)
 
 
-def write_predictions(path, ids, shards, checkpoint_sha256=None):
+def write_predictions(path, ids, shards, checkpoint_sha256=None, joint=None):
     indices = np.concatenate([idx for idx, _ in shards])
     values = np.concatenate([pred for _, pred in shards])
     order = indices.argsort()
     if (
         not np.array_equal(indices[order], np.arange(len(ids)))
-        or values.shape != (len(ids), 6, 1)
+        or values.shape != (len(ids), 6, 2 if joint else 1)
         or not np.isfinite(values).all()
     ):
         raise ValueError("Expected one finite six-hour prediction per input window")
     with NamedTemporaryFile(dir=path.parent) as tmp:
         provenance = {"checkpoint_sha256": checkpoint_sha256} if checkpoint_sha256 else {}
-        np.savez(tmp, window_id=ids, forecast_hour=np.arange(1, 7), predicted=values[order, :, 0], **provenance)
+        if joint:
+            provenance.update(channels=np.asarray(joint.channels), view=joint.view, scaler_sha256=joint.digest)
+        predicted = values[order] if joint else values[order, :, 0]
+        np.savez(tmp, window_id=ids, forecast_hour=np.arange(1, 7), predicted=predicted, **provenance)
         tmp.flush()
         os.link(tmp.name, path)
 
@@ -125,7 +196,12 @@ def main():
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--batch", type=int, default=32, help="Global inference batch size")
+    parser.add_argument("--input-view", choices=("first", "both"))
+    parser.add_argument("--scaler", type=Path)
     args = parser.parse_args()
+    if bool(args.input_view) != bool(args.scaler):
+        parser.error("Supply both input view and fitted scaler")
+    args.joint = JointInputs.load(args.scaler, args.input_view) if args.scaler else None
     rank = int(os.environ.get("RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
     if args.batch < world or args.batch % world:
@@ -141,6 +217,8 @@ def main():
         if manifest is None:
             raise ValueError("Expected a published checkpoint generation")
         identity = manifest["identity"]
+        if identity.get("joint") != (args.joint.identity() if args.joint else None):
+            raise ValueError("Checkpoint input view, channels or fitted scaler mismatch")
         if identity["model"] != MODEL_REVISION or identity["head"] not in {"direct", "persistence"}:
             raise ValueError("Incompatible forecast checkpoint")
         if identity["precision"] not in {"fp32", "bf16"}:
@@ -157,14 +235,15 @@ def main():
         if world > 1:
             dist.barrier()
         forecaster = PersistenceForecaster if identity["head"] == "persistence" else QwenForecaster
-        model = forecaster.from_pretrained(checkpoint_path=str(args.weights), local_files_only=True)
+        dimensions = {"channels": 2, "targets": 2} if args.joint else {}
+        model = forecaster.from_pretrained(checkpoint_path=str(args.weights), local_files_only=True, **dimensions)
         if identity["lora"]:
             add_lora(model)
         load_checkpoint_model(model, args.checkpoint, identity["lora"])
         model.to(device).eval()
         args.precision = identity["precision"]
         with np.load(args.data, allow_pickle=False) as data:
-            ids, history = read_history(data)
+            ids, history = read_history(data, args.joint)
         indices, values = [], []
         for idx, prediction in forecast_batches(model, history, args, rank, world, device):
             indices.append(idx.numpy())
@@ -176,7 +255,7 @@ def main():
             dist.gather_object(shard, shards, dst=0)
         if rank == 0:
             digest = sha256(args.checkpoint / "manifest.json")
-            write_predictions(args.output, ids, shards, digest)
+            write_predictions(args.output, ids, shards, digest, args.joint)
             print(json.dumps({"windows": len(ids), "checkpoint_sha256": digest, "output_sha256": sha256(args.output)}))
     finally:
         if world > 1:

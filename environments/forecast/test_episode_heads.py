@@ -238,3 +238,26 @@ def test_matched_point_uses_final_partial_batch_without_changing_legacy(count, e
     train = run_path(str(Path(__file__).resolve().parents[2] / "scripts/train_qwen_forecast.py"))
     assert train["epoch_batches"](count, 4, include_partial=True) == expected
     assert train["epoch_batches"](count, 4, include_partial=False) == count // 4
+
+
+@pytest.mark.parametrize("head", ["direct", "quantile", "episode", "persistence"])
+def test_previous_unpinned_checkpoint_resumes_only_with_same_recipe(tmp_path, head):
+    from runpy import run_path
+    from pathlib import Path
+    from opentslm.forecast_checkpoint import publish
+    from opentslm.forecast_inference import task_schema
+
+    train = run_path(str(Path(__file__).resolve().parents[2] / "scripts/train_qwen_forecast.py"))
+    prior = {"head": head, "trainer": train["PREVIOUS_TRAINER_SHA256"], "seed": 27}
+    if head in ("episode", "quantile"):
+        prior["task_schema"] = task_schema(head, "a" * 64)
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    (stage / "weights").write_bytes(b"fixture")
+    final, _ = publish(tmp_path, stage, 4, prior)
+    now = {**prior, "trainer": "current"}
+    resume = train["resume_generation"]
+    assert resume(tmp_path, now, False) == ((4, final), prior["trainer"])
+    assert resume(tmp_path, {**now, "matched_point": "complete_epoch_v1"}, False)[0] is None
+    assert resume(tmp_path, {**now, "seed": 28}, False)[0] is None
+    assert resume(tmp_path, now, True)[0] is None

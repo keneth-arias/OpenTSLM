@@ -31,6 +31,9 @@ from torch.nn.parallel import DistributedDataParallel
 LEGACY_TRAINER_SHA256 = "4a17f9f4a9efc393767cfa0d42d89bd29165bae9794bcefa0e4bf1006e6dd9db"
 
 
+PREVIOUS_TRAINER_SHA256 = "88beb175c7c0e4dec8480d9cd1d9fd10b5b2619cad6d377ef1337f73ecc0642e"
+
+
 def arguments():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data", required=True, type=Path)
@@ -139,12 +142,16 @@ def save(root, model, optimizer, scheduler, step, identity, rank, best_mae, metr
 
 def resume_generation(root, identity, pinned_source):
     generation = recover(root, identity)
-    if generation is None and "task_schema" not in identity and not pinned_source:
-        previous = {**identity, "trainer": LEGACY_TRAINER_SHA256}
-        generation = recover(root, previous)
+    if generation is not None or pinned_source or "matched_point" in identity:
+        return generation, identity["trainer"]
+    compatible = [PREVIOUS_TRAINER_SHA256]
+    if "task_schema" not in identity:
+        compatible.append(LEGACY_TRAINER_SHA256)
+    for revision in compatible:
+        generation = recover(root, {**identity, "trainer": revision})
         if generation is not None:
-            return generation, previous["trainer"]
-    return generation, identity["trainer"]
+            return generation, revision
+    return None, identity["trainer"]
 
 
 def restore(root, model, optimizer, scheduler, args, identity, rank):

@@ -19,12 +19,16 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from opentslm.forecast import FORECASTERS, MODEL_REVISION, task_loss
 from opentslm.forecast_checkpoint import point_to, publish, read_manifest, recover, sha256
-from opentslm.forecast_inference import JointInputs, add_lora, forecast, forecast_batches, read_task_data, state_options, task_schema
+from opentslm.forecast_inference import JointInputs, add_lora, forecast, forecast_batches, read_task_data, state_options, task_schema, verify_candidate_input
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
 from torch.nn.parallel import DistributedDataParallel
+
+
+# Script digest of the compatible unversioned direct/persistence trainer at d4a790e.
+LEGACY_TRAINER_SHA256 = "4a17f9f4a9efc393767cfa0d42d89bd29165bae9794bcefa0e4bf1006e6dd9db"
 
 
 def arguments():
@@ -50,6 +54,10 @@ def arguments():
     )
     p.add_argument("--resume", action="store_true")
     p.add_argument("--lora", action="store_true")
+    p.add_argument("--input-manifest", type=Path)
+    p.add_argument("--input-manifest-sha256")
+    p.add_argument("--validation-manifest", type=Path)
+    p.add_argument("--validation-manifest-sha256")
     p.add_argument("--thresholds-sha256", help="Frozen threshold manifest SHA-256 for episode fits")
     p.add_argument("--scaler", type=Path)
     p.add_argument("--input-view", choices=("first", "both"))
@@ -92,7 +100,7 @@ def save(root, model, optimizer, scheduler, step, identity, rank, best_mae, metr
     dist.barrier()
     if rank == 0:
         (staging / "training.pt.json").write_text(
-            json.dumps({"scheduler": scheduler.state_dict(), "best_mae": best_mae})
+            json.dumps({"scheduler": scheduler.state_dict(), **({"best_metric": best_mae, "metric": "brier_uncalibrated" if identity["head"] == "episode" else "mae"} if "task_schema" in identity else {"best_mae": best_mae})})
         )
         final, manifest = publish(root, staging, step, identity)
         if metric is not None and metric <= best_mae:
@@ -125,8 +133,16 @@ def save(root, model, optimizer, scheduler, step, identity, rank, best_mae, metr
 
 
 def restore(root, model, optimizer, scheduler, args, identity, rank):
-    selected = [recover(root, identity) if rank == 0 and args.resume else None]
+    selected = [None, identity["trainer"]]
+    if rank == 0 and args.resume:
+        selected[0] = recover(root, identity)
+        if selected[0] is None and "task_schema" not in identity and not os.environ.get("FORECAST_SOURCE_REVISION"):
+            previous = {**identity, "trainer": LEGACY_TRAINER_SHA256}
+            selected[0] = recover(root, previous)
+            if selected[0] is not None:
+                selected[1] = previous["trainer"]
     dist.broadcast_object_list(selected)
+    identity["trainer"] = selected[1]
     if selected[0] is None:
         if args.resume:
             raise ValueError("No complete compatible checkpoint")
@@ -148,7 +164,7 @@ def restore(root, model, optimizer, scheduler, args, identity, rank):
     torch.cuda.set_rng_state(rng["cuda"])
     if rank == 0:
         print(json.dumps({"restored_step": step, "checkpoint": path.name}), flush=True)
-    return step, metadata["best_mae"]
+    return step, metadata["best_metric"] if "best_metric" in metadata else metadata["best_mae"]
 
 
 @torch.no_grad()
@@ -161,21 +177,33 @@ def validation(model, data, args, rank, world, device):
         squared = torch.zeros((), dtype=torch.float64, device=device)
         for index, logit in forecast_batches(model, history, args, rank, world, device, thresholds):
             squared += (logit.sigmoid() - target[index].to(device)).square().sum(dtype=torch.float64)
+        dist.all_reduce(squared)
         model.train()
         return {"validation_windows": len(ids), "brier_uncalibrated": squared.item() / len(ids)}
     absolute = torch.zeros((6, target.shape[-1]), dtype=torch.float64, device=device)
     persistence = torch.zeros_like(absolute)
+    quantile_stats = torch.zeros((3, 6), dtype=torch.float64, device=device) if args.head == "quantile" else None
     model.eval()
     for index, predicted in forecast_batches(model, history, args, rank, world, device):
         y = target[index].to(device)
         if args.head == "quantile":
-            predicted = predicted[:, :, 1:2]
+            low, median, high = predicted.unbind(-1)
+            quantile_stats[0] += ((low <= y[..., 0]) & (y[..., 0] <= high)).sum(0)
+            quantile_stats[1] += (high - low).sum(0, dtype=torch.float64)
+            quantile_stats[2] += ((low > median) | (median > high)).sum(0)
+            predicted = median.unsqueeze(-1)
         absolute += (predicted - y).abs().sum(dim=0, dtype=torch.float64)
         if args.joint is None:
             last = history[index, -1:].to(device)
             persistence += (last - y).abs().sum(dim=0, dtype=torch.float64)
     dist.all_reduce(absolute)
     dist.all_reduce(persistence)
+    intervals = {}
+    if quantile_stats is not None:
+        dist.all_reduce(quantile_stats)
+        intervals = {"coverage_by_horizon": (quantile_stats[0] / len(ids)).tolist(),
+                     "width_by_horizon": (quantile_stats[1] / len(ids)).tolist(),
+                     "crossed_by_horizon": quantile_stats[2].int().tolist()}
     model.train()
     if args.joint:
         return {"validation_windows": len(ids), "mae": absolute.mean().item() / len(ids),
@@ -183,12 +211,17 @@ def validation(model, data, args, rank, world, device):
     return {
         "validation_windows": len(ids),
         "mae": absolute.mean().item() / len(ids),
+        **intervals,
         "mae_by_horizon": (absolute[:, 0] / len(ids)).tolist(),
         "persistence_mae": persistence.mean().item() / len(ids),
     }
 
 
 def train(args, rank, world, device):
+    if args.task_schema:
+        verify_candidate_input(args.data, args.input_manifest, args.input_manifest_sha256, "fit", args.head, args.thresholds_sha256)
+        if args.validation:
+            verify_candidate_input(args.validation, args.validation_manifest, args.validation_manifest_sha256, "inner_validation", args.head, args.thresholds_sha256)
     ids, history, targets, thresholds = read_task_data(args.data, args.joint, args.head, args.thresholds_sha256)
     batches = math.ceil(len(ids) / args.batch) if args.joint or args.task_schema else len(ids) // args.batch
     if batches < 1:
@@ -213,7 +246,8 @@ def train(args, rank, world, device):
         "weights": sha256(args.weights.parent / "SHA256SUMS"),
     }
     if args.task_schema:
-        identity["task_schema"] = args.task_schema
+        identity.update(task_schema=args.task_schema, input_manifest_sha256=args.input_manifest_sha256,
+                        validation_manifest_sha256=args.validation_manifest_sha256)
     if args.validate_at != "checkpoint":
         identity["validate_at"] = args.validate_at
     if rank == 0 and not args.resume and list(args.run_dir.glob("step-????????")):

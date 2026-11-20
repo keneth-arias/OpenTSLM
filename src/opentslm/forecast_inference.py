@@ -22,6 +22,11 @@ from opentslm.forecast import FORECASTERS, MODEL_REVISION, QUANTILES
 from opentslm.forecast_checkpoint import files, read_manifest, sha256
 
 
+LORA_RANK = 4
+LORA_ALPHA = 8
+MAX_THRESHOLD_STD = 100.0
+
+
 @dataclass(frozen=True)
 class JointInputs:
     channels: tuple
@@ -72,7 +77,7 @@ def read_history(data, joint=None, *, require_history_only=False, episode=False)
     if require_history_only:
         fields = {"window_id", "history", "channels"} if joint else {"window_id", "history"}
         if episode:
-            fields.update(("threshold_ug_m3", "thresholds_sha256"))
+            fields.update(("station_key", "threshold_ug_m3", "thresholds_sha256"))
         if set(data) != fields:
             raise ValueError(f"Expected a history-only archive with fields {sorted(fields)}")
     ids = data["window_id"]
@@ -91,6 +96,8 @@ def read_history(data, joint=None, *, require_history_only=False, episode=False)
         or ids.ndim != 1
         or ids.dtype.kind not in "Uifu"
         or not len(ids)
+        or (ids.dtype.kind == "f" and not np.isfinite(ids).all())
+        or (ids.dtype.kind == "U" and np.any(ids == ""))
         or len(np.unique(ids)) != len(ids)
         or not history.isfinite().all()
     ):
@@ -112,14 +119,43 @@ def read_data(path, joint=None):
 def task_schema(head, threshold_hash=None):
     if head not in ("quantile", "episode"):
         return None
-    schema = {"version": 1, "head": head, "horizon": 6, "lora_rank": 4, "lora_alpha": 8}
+    schema = {"version": 2, "transform": "history_mean_population_std_flat_one_v1", "unit": "ug/m3", "head": head, "horizon": 6, "lora_rank": LORA_RANK, "lora_alpha": LORA_ALPHA}
     if head == "episode":
         if not isinstance(threshold_hash, str) or not re.fullmatch("[0-9a-f]{64}", threshold_hash):
             raise ValueError("Expected a frozen threshold manifest SHA-256")
-        schema.update(target="any_ge_h1_h6_v1", thresholds_sha256=threshold_hash)
+        schema.update(target="any_ge_h1_h6_v1", max_threshold_std=MAX_THRESHOLD_STD, thresholds_sha256=threshold_hash)
     else:
-        schema["levels"] = list(QUANTILES)
+        schema.update(levels=list(QUANTILES), target="hourly_concentration_h1_h6_v1")
     return schema
+
+
+def verify_candidate_input(data_path, manifest_path, expected_digest, phase, head, threshold_hash):
+    """Verify the phase artifact and independently join frozen station thresholds."""
+    if not manifest_path or not expected_digest or sha256(manifest_path) != expected_digest:
+        raise ValueError("Expected the pinned candidate input manifest")
+    spec = json.loads(manifest_path.read_text())
+    if (spec.get("schema"), spec.get("unit"), spec.get("phase"), spec.get("head")) != (
+        "forecast-input-v1", "ug/m3", phase, head
+    ):
+        raise ValueError("Candidate input phase, head, units or schema mismatch")
+    if spec.get("files", {}).get(data_path.name) != sha256(data_path):
+        raise ValueError("Input archive checksum mismatch")
+    if head == "episode":
+        source = manifest_path.parent / "thresholds.json"
+        if (source.is_symlink() or spec.get("thresholds_sha256") != threshold_hash
+                or spec["files"].get(source.name) != threshold_hash or sha256(source) != threshold_hash):
+            raise ValueError("Frozen station threshold manifest mismatch")
+        table = json.loads(source.read_text())
+        if table.get("unit") != "ug/m3" or not isinstance(table.get("stations"), dict):
+            raise ValueError("Invalid station threshold units or table")
+        with np.load(data_path, allow_pickle=False) as rows:
+            stations = rows["station_key"]
+            if stations.dtype.kind != "U" or stations.shape != rows["window_id"].shape:
+                raise ValueError("Invalid station keys for threshold lookup")
+            expected = np.array([table["stations"].get(station, np.nan) for station in stations], dtype=float)
+            if (not np.isfinite(expected).all() or not np.array_equal(expected, rows["threshold_ug_m3"])
+                    or rows["thresholds_sha256"].item() != threshold_hash):
+                raise ValueError("Station threshold differs from the frozen table")
 
 
 def episode_thresholds(data, ids, expected_hash):
@@ -135,6 +171,9 @@ def read_task_data(path, joint, head, threshold_hash):
     if head != "episode":
         return (*read_data(path, joint), None)
     with np.load(path, allow_pickle=False) as data:
+        fields = {"window_id", "station_key", "history", "threshold_ug_m3", "thresholds_sha256", "event"}
+        if set(data.files) != fields:
+            raise ValueError(f"Expected episode training fields {sorted(fields)}")
         ids, history = read_history(data)
         thresholds = episode_thresholds(data, ids, threshold_hash)
         event = data["event"]
@@ -160,7 +199,7 @@ def add_lora(model):
         "in_proj_b",
         "out_proj",
     ]
-    model.decoder = inject_adapter_in_model(LoraConfig(r=4, lora_alpha=8, target_modules=targets), model.decoder)
+    model.decoder = inject_adapter_in_model(LoraConfig(r=LORA_RANK, lora_alpha=LORA_ALPHA, target_modules=targets), model.decoder)
     names = [name for name, _ in model.decoder.named_parameters() if ".lora_B." in name]
     expected = {
         index: 4 if kind == "full_attention" else 5 for index, kind in enumerate(model.decoder.config.layer_types)
@@ -191,7 +230,7 @@ def forecast(model, history, args, thresholds=None):
         normalized = (torch.where(observed, history, center) - center) / scale
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.precision == "bf16"):
         if getattr(args, "head", None) == "episode":
-            context = (thresholds - center.flatten()) / scale.flatten()
+            context = ((thresholds - center.flatten()) / scale.flatten()).clamp(-MAX_THRESHOLD_STD, MAX_THRESHOLD_STD)
             predicted = model(normalized, observed, context)
         else:
             predicted = model(normalized, observed)
@@ -222,7 +261,7 @@ def load_checkpoint_model(model, checkpoint, lora):
 
 
 def write_predictions(path, ids, shards, checkpoint_sha256=None, joint=None, *, head="direct",
-                      input_sha256=None, thresholds_sha256=None):
+                      input_sha256=None, thresholds_sha256=None, input_manifest_sha256=None):
     indices = np.concatenate([idx for idx, _ in shards])
     values = np.concatenate([pred for _, pred in shards])
     order = indices.argsort()
@@ -238,14 +277,17 @@ def write_predictions(path, ids, shards, checkpoint_sha256=None, joint=None, *, 
     if checkpoint_sha256:
         payload["checkpoint_sha256"] = checkpoint_sha256
     if head in ("episode", "quantile"):
-        payload.update(task=head, input_sha256=input_sha256, schema_version=1)
+        payload.update(task=head, input_sha256=input_sha256, schema_version=2, model_revision=MODEL_REVISION,
+                       input_manifest_sha256=input_manifest_sha256, unit="ug/m3" if head == "quantile" else "logit")
     if head == "episode":
         payload.update(episode_logit=values, thresholds_sha256=thresholds_sha256)
     else:
         payload["forecast_hour"] = np.arange(1, 7)
         if head == "quantile":
-            if (np.diff(values, axis=-1) < 0).any():
-                raise ValueError("Crossed forecast quantiles")
+            crossed = (np.diff(values, axis=-1) < 0).any(axis=-1)
+            if crossed.any():
+                row, horizon = np.argwhere(crossed)[0]
+                raise ValueError(f"Crossed forecast quantiles at {int(crossed.sum())} window-hours; first {ids[row]} +{horizon + 1}h")
             payload.update(quantiles=values, levels=np.asarray(QUANTILES), predicted=values[:, :, 1])
         else:
             payload["predicted"] = values if joint else values[:, :, 0]
@@ -267,6 +309,8 @@ def main():
     parser.add_argument("--input-view", choices=("first", "both"))
     parser.add_argument("--scaler", type=Path)
     parser.add_argument("--head", choices=tuple(FORECASTERS), help="Required for versioned candidate outputs")
+    parser.add_argument("--input-manifest", type=Path)
+    parser.add_argument("--input-manifest-sha256")
     parser.add_argument("--thresholds-sha256", help="Frozen threshold manifest for episode inference")
     parser.add_argument(
         "--require-history-only", action="store_true", help="Reject fields outside the history input schema"
@@ -284,6 +328,8 @@ def main():
     schema = task_schema(args.head, args.thresholds_sha256)
     if (schema and args.joint) or (args.thresholds_sha256 and args.head != "episode"):
         parser.error("Candidate heads use univariate inputs; only episodes use thresholds")
+    if schema:
+        verify_candidate_input(args.data, args.input_manifest, args.input_manifest_sha256, "infer", args.head, args.thresholds_sha256)
     with np.load(args.data, allow_pickle=False) as data:
         ids, history = read_history(data, args.joint, require_history_only=args.require_history_only or bool(schema),
                                     episode=args.head == "episode")
@@ -340,7 +386,7 @@ def main():
             digest = sha256(args.checkpoint / "manifest.json")
             write_predictions(args.output, ids, shards, digest, args.joint, head=args.head,
                               input_sha256=sha256(args.data) if schema else None,
-                              thresholds_sha256=args.thresholds_sha256)
+                              thresholds_sha256=args.thresholds_sha256, input_manifest_sha256=args.input_manifest_sha256)
             print(json.dumps({"windows": len(ids), "checkpoint_sha256": digest, "output_sha256": sha256(args.output)}))
     finally:
         if world > 1:

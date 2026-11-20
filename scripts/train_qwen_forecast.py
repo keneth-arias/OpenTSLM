@@ -3,6 +3,8 @@
 """Train a numerical Qwen head with reproducible single-node checkpoints."""
 
 import argparse
+import hashlib
+import math
 import fcntl
 import json
 import os
@@ -17,7 +19,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from opentslm.forecast import MODEL_REVISION, PersistenceForecaster, QwenForecaster
 from opentslm.forecast_checkpoint import point_to, publish, read_manifest, recover, sha256
-from opentslm.forecast_inference import add_lora, forecast, forecast_batches, read_data, state_options
+from opentslm.forecast_inference import JointInputs, add_lora, forecast, forecast_batches, read_data, state_options
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
@@ -48,7 +50,14 @@ def arguments():
     )
     p.add_argument("--resume", action="store_true")
     p.add_argument("--lora", action="store_true")
+    p.add_argument("--scaler", type=Path)
+    p.add_argument("--input-view", choices=("first", "both"))
     args = p.parse_args()
+    if bool(args.input_view) != bool(args.scaler):
+        p.error("Supply both input view and fitted scaler")
+    if args.scaler and (args.mode != "single" or args.head != "direct"):
+        p.error("Matched two-channel fits require a single worker and direct head")
+    args.joint = JointInputs.load(args.scaler, args.input_view) if args.scaler else None
     if not 0 < args.stop_step <= args.schedule_steps or args.save_seconds < 0:
         p.error("Invalid stopping step, schedule or save interval")
     if args.lora and args.mode == "fsdp":
@@ -138,31 +147,35 @@ def validation(model, data, args, rank, world, device):
     # Every rank must execute the same number of FSDP gathers. Pad only the
     # final batch and discard those padding rows from metric reductions.
     ids, history, target = data
-    absolute = torch.zeros(6, dtype=torch.float64, device=device)
+    absolute = torch.zeros((6, target.shape[-1]), dtype=torch.float64, device=device)
     persistence = torch.zeros_like(absolute)
     model.eval()
     for index, predicted in forecast_batches(model, history, args, rank, world, device):
         y = target[index].to(device)
-        absolute += (predicted - y).abs().sum(dim=(0, 2), dtype=torch.float64)
-        last = history[index, -1:].to(device)
-        persistence += (last - y).abs().sum(dim=(0, 2), dtype=torch.float64)
+        absolute += (predicted - y).abs().sum(dim=0, dtype=torch.float64)
+        if args.joint is None:
+            last = history[index, -1:].to(device)
+            persistence += (last - y).abs().sum(dim=0, dtype=torch.float64)
     dist.all_reduce(absolute)
     dist.all_reduce(persistence)
     model.train()
+    if args.joint:
+        return {"validation_windows": len(ids), "mae": absolute.mean().item() / len(ids),
+                "channel_mae_by_horizon": (absolute / len(ids)).tolist()}
     return {
         "validation_windows": len(ids),
         "mae": absolute.mean().item() / len(ids),
-        "mae_by_horizon": (absolute / len(ids)).tolist(),
+        "mae_by_horizon": (absolute[:, 0] / len(ids)).tolist(),
         "persistence_mae": persistence.mean().item() / len(ids),
     }
 
 
 def train(args, rank, world, device):
-    ids, history, targets = read_data(args.data)
-    batches = len(ids) // args.batch
+    ids, history, targets = read_data(args.data, args.joint)
+    batches = math.ceil(len(ids) / args.batch) if args.joint else len(ids) // args.batch
     if batches < 1:
         raise ValueError("One complete training batch is required")
-    evaluation = read_data(args.validation) if args.validation else None
+    evaluation = read_data(args.validation, args.joint) if args.validation else None
     if evaluation is not None and (not len(evaluation[0]) or np.intersect1d(ids, evaluation[0]).size):
         raise ValueError("Validation must be nonempty and disjoint from training")
     identity = {
@@ -187,10 +200,19 @@ def train(args, rank, world, device):
         raise FileExistsError("Choose a new run directory or resume")
     torch.manual_seed(args.seed)
     forecaster = PersistenceForecaster if args.head == "persistence" else QwenForecaster
-    model = forecaster.from_pretrained(checkpoint_path=str(args.weights), local_files_only=True)
+    dimensions = {"channels": 2, "targets": 2} if args.joint else {}
+    model = forecaster.from_pretrained(checkpoint_path=str(args.weights), local_files_only=True, **dimensions)
     # The embedding table is unused with numerical soft prompts.
     model.decoder.get_input_embeddings().requires_grad_(False)
     adapters = add_lora(model) if args.lora else []
+    if args.joint:
+        identity["joint"] = args.joint.identity()
+        initial = hashlib.sha256()
+        for name, parameter in model.named_parameters():
+            if parameter.requires_grad:
+                initial.update(name.encode())
+                initial.update(parameter.detach().contiguous().numpy().tobytes())
+        identity["initial_trainable_sha256"] = initial.hexdigest()
     if adapters and rank == 0:
         print(json.dumps({"adapter_modules": adapters}), flush=True)
     model = model.to(device)
@@ -258,7 +280,7 @@ def train(args, rank, world, device):
                         "loss": loss_value.item(),
                         "learning_rate_next": scheduler.get_last_lr()[0],
                         "window_ids": ids[indices.numpy()].tolist(),
-                        "windows_per_second": args.batch / elapsed.item(),
+                        "windows_per_second": len(indices) / elapsed.item(),
                         "peak_bytes_per_rank": [v.tolist() for v in per_rank],
                         "probe_global_elements": probe.numel(),
                         "probe_local_elements": shard,

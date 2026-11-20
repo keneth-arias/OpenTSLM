@@ -67,7 +67,11 @@ class JointInputs:
         }
 
 
-def read_history(data, joint=None):
+def read_history(data, joint=None, *, require_history_only=False):
+    if require_history_only:
+        fields = {"window_id", "history", "channels"} if joint else {"window_id", "history"}
+        if set(data) != fields:
+            raise ValueError(f"Expected a history-only archive with fields {sorted(fields)}")
     ids = data["window_id"]
     raw = data["history"]
     if joint:
@@ -198,6 +202,9 @@ def main():
     parser.add_argument("--batch", type=int, default=32, help="Global inference batch size")
     parser.add_argument("--input-view", choices=("first", "both"))
     parser.add_argument("--scaler", type=Path)
+    parser.add_argument(
+        "--require-history-only", action="store_true", help="Reject fields outside the history input schema"
+    )
     args = parser.parse_args()
     if bool(args.input_view) != bool(args.scaler):
         parser.error("Supply both input view and fitted scaler")
@@ -208,6 +215,8 @@ def main():
         parser.error("Global batch must be a positive multiple of the inference world size")
     if args.output.exists():
         raise FileExistsError(args.output)
+    with np.load(args.data, allow_pickle=False) as data:
+        ids, history = read_history(data, args.joint, require_history_only=args.require_history_only)
     device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
     torch.cuda.set_device(device)
     if world > 1:
@@ -242,8 +251,6 @@ def main():
         load_checkpoint_model(model, args.checkpoint, identity["lora"])
         model.to(device).eval()
         args.precision = identity["precision"]
-        with np.load(args.data, allow_pickle=False) as data:
-            ids, history = read_history(data, args.joint)
         indices, values = [], []
         for idx, prediction in forecast_batches(model, history, args, rank, world, device):
             indices.append(idx.numpy())

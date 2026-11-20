@@ -34,6 +34,8 @@ PYTHONPATH=src python -m opentslm.forecast_inference \
 
 For two GPUs use `torchrun --standalone --nproc-per-node=2 --module opentslm.forecast_inference` with the same arguments. The input requires window IDs and a finite 24-hour history. The NPZ output carries the input order, forecast hours 1 through 6, predictions in original units and the checkpoint manifest SHA-256. Targets are only needed when independently scoring the export. Each output path can be published once.
 
+For the Lima pilot, add `--require-history-only` to the inference command. The point archive must contain exactly `window_id` and `history`. A two-channel archive also requires `channels`. Strict mode checks these fields before initializing CUDA or loading weights. Target-bearing archives remain available to the separate scoring job.
+
 For matched two-channel regression, supply `--input-view first` or `--input-view both`
 and `--scaler PATH` to the single-worker direct trainer and to checkpoint inference.
 The training archive contains `history[N,24,2]`, `targets[N,6,2]`, ordered

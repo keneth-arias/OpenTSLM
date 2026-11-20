@@ -5,6 +5,8 @@ SPDX-License-Identifier: MIT
 
 # Numerical forecasts with Qwen3.5
 
+The [AirAware improvement plan](../../tasks/plan.md) describes the proposed interval and six-hour episode outputs and their acceptance tests.
+
 From the repository root, create the isolated Python 3.13 environment and fetch the pinned Qwen snapshot once. Download only the configuration, weight index and weights.
 
 ```sh

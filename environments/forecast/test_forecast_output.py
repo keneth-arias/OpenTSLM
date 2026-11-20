@@ -58,3 +58,19 @@ def test_restored_rows_match_before_save_and_exclude_last_batch_padding(tmp_path
         write_predictions(output, ids, shards)
     with pytest.raises(ValueError):
         write_predictions(tmp_path / "bad.npz", ids, shards[:1])
+
+
+@pytest.mark.parametrize("joint", [None, SimpleNamespace(channels=("pm25", "pm10"), view="both")])
+def test_strict_history_archive_excludes_future_and_unrecognized_fields(joint):
+    from opentslm.forecast_inference import read_history
+
+    shape = (2, 24, 2) if joint else (2, 24)
+    data = {"window_id": np.array(["b", "a"]), "history": np.ones(shape)}
+    if joint:
+        data["channels"] = np.array(joint.channels)
+    ids, _ = read_history(data, joint, require_history_only=True)
+    np.testing.assert_array_equal(ids, data["window_id"])
+    for field in ("targets", "future_max"):
+        with pytest.raises(ValueError, match="history-only"):
+            read_history({**data, field: np.zeros(2)}, joint, require_history_only=True)
+    read_history({**data, "targets": np.ones((2, 6))}, joint)

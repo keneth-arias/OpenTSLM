@@ -5,6 +5,8 @@ SPDX-License-Identifier: MIT
 
 # Numerical forecasts with Qwen3.5
 
+The [AirAware improvement plan](../../tasks/plan.md) describes the proposed interval and six-hour episode outputs and their acceptance tests.
+
 From the repository root, create the isolated Python 3.13 environment and fetch the pinned Qwen snapshot once. Download only the configuration, weight index and weights.
 
 ```sh
@@ -32,6 +34,8 @@ PYTHONPATH=src python -m opentslm.forecast_inference \
 
 For two GPUs use `torchrun --standalone --nproc-per-node=2 --module opentslm.forecast_inference` with the same arguments. The input requires window IDs and a finite 24-hour history. The NPZ output carries the input order, forecast hours 1 through 6, predictions in original units and the checkpoint manifest SHA-256. Targets are only needed when independently scoring the export. Each output path can be published once.
 
+For the Lima pilot, add `--require-history-only` to the inference command. The point archive must contain exactly `window_id` and `history`. A two-channel archive also requires `channels`. Strict mode checks these fields before initializing CUDA or loading weights. Target-bearing archives remain available to the separate scoring job.
+
 For matched two-channel regression, supply `--input-view first` or `--input-view both`
 and `--scaler PATH` to the single-worker direct trainer and to checkpoint inference.
 The training archive contains `history[N,24,2]`, `targets[N,6,2]`, ordered
@@ -40,3 +44,13 @@ The fitted JSON scaler records the input version, ordered channels, population m
 positive scales for training. The first-input view masks the second channel before scaling.
 Both variants emit both targets in the original units and train on the final partial batch.
 Restoration checks the scaler and input view recorded in the checkpoint manifest.
+
+## Six-hour candidate heads
+
+Use `scripts/train_qwen_forecast.py --mode single --head quantile` or `--head episode` with the usual training arguments. Both candidates use rank-4 LoRA, alpha 8 and the fixed final update for evaluation. The quantile task uses the univariate H24/F6 training archive and emits ordered q10, q50 and q90 for each forecast hour. The point estimate is the median.
+
+An episode fit reads `window_id`, `history`, `threshold_ug_m3[N]`, a scalar `thresholds_sha256`, and one `event[N]` label (0, 1, or −1 for ineligible). Pass the frozen table digest with `--thresholds-sha256` for fit, resume and inference. Each station threshold is supplied in raw units and uses the same transform as its window. Use only eligible labels from the data owner. The history-only inference archive omits `event`; the episode output contains one raw `episode_logit` per ID. Calibration is a separate AirAware step.
+
+For inference repeat the selected `--head` with the usual checkpoint, base weights, input and output paths. A versioned checkpoint records task definition, levels or threshold-table digest, and adapter configuration. A legacy point checkpoint keeps its original identity.
+
+For candidate fits and inference, pass `--input-manifest PATH --input-manifest-sha256 SHA256`. The JSON manifest pins the SHA-256 of the NPZ under `files`, declares `schema=forecast-input-v1`, `unit=ug/m3`, the head and the phase (`fit` or `infer`). Inner validation uses separate `--validation-manifest` and digest with phase `inner_validation`. The episode bundle also contains a frozen `thresholds.json` with unit and station-to-threshold mapping. Include its digest in `files`, `thresholds_sha256` and the CLI. The NPZ supplies `station_key` per window. Fit and inference verify each raw threshold with the table. The model bounds the standardized threshold at ±100 standard deviations to keep near-constant histories numerically stable. Candidate exports record the input and manifest digests, model revision, units and checkpoint digest.

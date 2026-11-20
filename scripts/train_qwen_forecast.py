@@ -17,14 +17,18 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from opentslm.forecast import MODEL_REVISION, PersistenceForecaster, QwenForecaster
+from opentslm.forecast import FORECASTERS, MODEL_REVISION, task_loss
 from opentslm.forecast_checkpoint import point_to, publish, read_manifest, recover, sha256
-from opentslm.forecast_inference import JointInputs, add_lora, forecast, forecast_batches, read_data, state_options
+from opentslm.forecast_inference import JointInputs, add_lora, forecast, forecast_batches, read_task_data, state_options, task_schema, verify_candidate_input
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor
 from torch.nn.parallel import DistributedDataParallel
+
+
+# Script digest of the compatible unversioned direct/persistence trainer at d4a790e.
+LEGACY_TRAINER_SHA256 = "4a17f9f4a9efc393767cfa0d42d89bd29165bae9794bcefa0e4bf1006e6dd9db"
 
 
 def arguments():
@@ -36,7 +40,7 @@ def arguments():
     p.add_argument("--schedule-steps", required=True, type=int)
     p.add_argument("--batch", type=int, default=4, help="Global batch size")
     p.add_argument("--mode", choices=("single", "ddp", "fsdp"), default="fsdp")
-    p.add_argument("--head", choices=("direct", "persistence"), default="direct")
+    p.add_argument("--head", choices=tuple(FORECASTERS), default="direct")
     p.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
     p.add_argument("--seed", type=int, default=27)
     p.add_argument("--save-seconds", type=int, default=900)
@@ -50,9 +54,24 @@ def arguments():
     )
     p.add_argument("--resume", action="store_true")
     p.add_argument("--lora", action="store_true")
+    p.add_argument("--input-manifest", type=Path)
+    p.add_argument("--input-manifest-sha256")
+    p.add_argument("--validation-manifest", type=Path)
+    p.add_argument("--validation-manifest-sha256")
+    p.add_argument("--thresholds-sha256", help="Frozen threshold manifest SHA-256 for episode fits")
     p.add_argument("--scaler", type=Path)
     p.add_argument("--input-view", choices=("first", "both"))
     args = p.parse_args()
+    if args.head in ("quantile", "episode"):
+        if args.mode != "single" or args.input_view:
+            p.error("Candidate heads require single-worker univariate training")
+        args.lora = True
+        args.validate_at = "final"
+    if args.thresholds_sha256 and args.head != "episode":
+        p.error("Only the episode head uses station thresholds")
+    if args.head == "episode" and not args.thresholds_sha256:
+        p.error("Supply --thresholds-sha256 for episode fits")
+    args.task_schema = task_schema(args.head, args.thresholds_sha256)
     if bool(args.input_view) != bool(args.scaler):
         p.error("Supply both input view and fitted scaler")
     if args.scaler and (args.mode != "single" or args.head != "direct"):
@@ -83,7 +102,7 @@ def save(root, model, optimizer, scheduler, step, identity, rank, best_mae, metr
     dist.barrier()
     if rank == 0:
         (staging / "training.pt.json").write_text(
-            json.dumps({"scheduler": scheduler.state_dict(), "best_mae": best_mae})
+            json.dumps({"scheduler": scheduler.state_dict(), **({"best_metric": best_mae, "metric": "brier_uncalibrated" if identity["head"] == "episode" else "mae"} if "task_schema" in identity else {"best_mae": best_mae})})
         )
         final, manifest = publish(root, staging, step, identity)
         if metric is not None and metric <= best_mae:
@@ -115,9 +134,22 @@ def save(root, model, optimizer, scheduler, step, identity, rank, best_mae, metr
     dist.barrier()
 
 
+def resume_generation(root, identity, pinned_source):
+    generation = recover(root, identity)
+    if generation is None and "task_schema" not in identity and not pinned_source:
+        previous = {**identity, "trainer": LEGACY_TRAINER_SHA256}
+        generation = recover(root, previous)
+        if generation is not None:
+            return generation, previous["trainer"]
+    return generation, identity["trainer"]
+
+
 def restore(root, model, optimizer, scheduler, args, identity, rank):
-    selected = [recover(root, identity) if rank == 0 and args.resume else None]
+    selected = [None, identity["trainer"]]
+    if rank == 0 and args.resume:
+        selected[:] = resume_generation(root,identity,bool(os.environ.get("FORECAST_SOURCE_REVISION")))
     dist.broadcast_object_list(selected)
+    identity["trainer"] = selected[1]
     if selected[0] is None:
         if args.resume:
             raise ValueError("No complete compatible checkpoint")
@@ -139,25 +171,46 @@ def restore(root, model, optimizer, scheduler, args, identity, rank):
     torch.cuda.set_rng_state(rng["cuda"])
     if rank == 0:
         print(json.dumps({"restored_step": step, "checkpoint": path.name}), flush=True)
-    return step, metadata["best_mae"]
+    return step, metadata["best_metric"] if "best_metric" in metadata else metadata["best_mae"]
 
 
 @torch.no_grad()
 def validation(model, data, args, rank, world, device):
     # Every rank must execute the same number of FSDP gathers. Pad only the
     # final batch and discard those padding rows from metric reductions.
-    ids, history, target = data
+    ids, history, target, thresholds = data
+    if args.head == "episode":
+        model.eval()
+        squared = torch.zeros((), dtype=torch.float64, device=device)
+        for index, logit in forecast_batches(model, history, args, rank, world, device, thresholds):
+            squared += (logit.sigmoid() - target[index].to(device)).square().sum(dtype=torch.float64)
+        dist.all_reduce(squared)
+        model.train()
+        return {"validation_windows": len(ids), "brier_uncalibrated": squared.item() / len(ids)}
     absolute = torch.zeros((6, target.shape[-1]), dtype=torch.float64, device=device)
     persistence = torch.zeros_like(absolute)
+    quantile_stats = torch.zeros((3, 6), dtype=torch.float64, device=device) if args.head == "quantile" else None
     model.eval()
     for index, predicted in forecast_batches(model, history, args, rank, world, device):
         y = target[index].to(device)
+        if args.head == "quantile":
+            low, median, high = predicted.unbind(-1)
+            quantile_stats[0] += ((low <= y[..., 0]) & (y[..., 0] <= high)).sum(0)
+            quantile_stats[1] += (high - low).sum(0, dtype=torch.float64)
+            quantile_stats[2] += ((low > median) | (median > high)).sum(0)
+            predicted = median.unsqueeze(-1)
         absolute += (predicted - y).abs().sum(dim=0, dtype=torch.float64)
         if args.joint is None:
             last = history[index, -1:].to(device)
             persistence += (last - y).abs().sum(dim=0, dtype=torch.float64)
     dist.all_reduce(absolute)
     dist.all_reduce(persistence)
+    intervals = {}
+    if quantile_stats is not None:
+        dist.all_reduce(quantile_stats)
+        intervals = {"coverage_by_horizon": (quantile_stats[0] / len(ids)).tolist(),
+                     "width_by_horizon": (quantile_stats[1] / len(ids)).tolist(),
+                     "crossed_by_horizon": quantile_stats[2].int().tolist()}
     model.train()
     if args.joint:
         return {"validation_windows": len(ids), "mae": absolute.mean().item() / len(ids),
@@ -165,17 +218,22 @@ def validation(model, data, args, rank, world, device):
     return {
         "validation_windows": len(ids),
         "mae": absolute.mean().item() / len(ids),
+        **intervals,
         "mae_by_horizon": (absolute[:, 0] / len(ids)).tolist(),
         "persistence_mae": persistence.mean().item() / len(ids),
     }
 
 
 def train(args, rank, world, device):
-    ids, history, targets = read_data(args.data, args.joint)
-    batches = math.ceil(len(ids) / args.batch) if args.joint else len(ids) // args.batch
+    if args.task_schema:
+        verify_candidate_input(args.data, args.input_manifest, args.input_manifest_sha256, "fit", args.head, args.thresholds_sha256)
+        if args.validation:
+            verify_candidate_input(args.validation, args.validation_manifest, args.validation_manifest_sha256, "inner_validation", args.head, args.thresholds_sha256)
+    ids, history, targets, thresholds = read_task_data(args.data, args.joint, args.head, args.thresholds_sha256)
+    batches = math.ceil(len(ids) / args.batch) if args.joint or args.task_schema else len(ids) // args.batch
     if batches < 1:
         raise ValueError("One complete training batch is required")
-    evaluation = read_data(args.validation, args.joint) if args.validation else None
+    evaluation = read_task_data(args.validation, args.joint, args.head, args.thresholds_sha256) if args.validation else None
     if evaluation is not None and (not len(evaluation[0]) or np.intersect1d(ids, evaluation[0]).size):
         raise ValueError("Validation must be nonempty and disjoint from training")
     identity = {
@@ -194,12 +252,15 @@ def train(args, rank, world, device):
         "trainer": os.environ.get("FORECAST_SOURCE_REVISION", sha256(Path(__file__))),
         "weights": sha256(args.weights.parent / "SHA256SUMS"),
     }
+    if args.task_schema:
+        identity.update(task_schema=args.task_schema, input_manifest_sha256=args.input_manifest_sha256,
+                        validation_manifest_sha256=args.validation_manifest_sha256)
     if args.validate_at != "checkpoint":
         identity["validate_at"] = args.validate_at
     if rank == 0 and not args.resume and list(args.run_dir.glob("step-????????")):
         raise FileExistsError("Choose a new run directory or resume")
     torch.manual_seed(args.seed)
-    forecaster = PersistenceForecaster if args.head == "persistence" else QwenForecaster
+    forecaster = FORECASTERS[args.head]
     dimensions = {"channels": 2, "targets": 2} if args.joint else {}
     model = forecaster.from_pretrained(checkpoint_path=str(args.weights), local_files_only=True, **dimensions)
     # The embedding table is unused with numerical soft prompts.
@@ -247,8 +308,9 @@ def train(args, rank, world, device):
         torch.cuda.synchronize()
         started = time.monotonic()
         optimizer.zero_grad(set_to_none=True)
-        prediction, center, scale = forecast(model, x, args)
-        loss = torch.nn.functional.mse_loss(prediction, (y - center) / scale)
+        context = thresholds[subset].to(device) if thresholds is not None else None
+        prediction, center, scale = forecast(model, x, args, context)
+        loss = task_loss(args.head, prediction, y, center, scale)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True, foreach=False)
         optimizer.step()
@@ -299,7 +361,7 @@ def train(args, rank, world, device):
             metrics = validation(model, evaluation, args, rank, world, device) if evaluate_now else {}
             if rank == 0 and metrics:
                 print(json.dumps({"step": step, **metrics}), flush=True)
-            metric = metrics.get("mae")
+            metric = metrics.get("brier_uncalibrated" if args.head == "episode" else "mae")
             if metric is not None:
                 best = metric if best is None else min(best, metric)
             save(args.run_dir, model, optimizer, scheduler, step, identity, rank, best, metric)

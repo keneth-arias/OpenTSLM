@@ -24,3 +24,13 @@ Help residents near a Lima monitoring station compare the next six hourly PM2.5 
 4. **Restore and release the chosen heads.** Version new checkpoint identities with task, target definition, rank/alpha, levels and input/transform hashes. The existing recovery path compares entire identity dictionaries. Preserve the original unversioned identity for legacy resume. Interpret legacy inference as the recorded point head and boolean LoRA flag (rank 4, alpha 8 if enabled). Test exact identity checks within each version, including rejection of a changed threshold artifact. Support old direct and persistence checkpoints and the current two-channel input views. Qualify new heads on one GPU first. A task mismatch must fail before an output is written.
 
 The first handoff uses the existing direct path on five synthetic AirAware histories. Train subsequent candidates on a separate labeled fixture. Preserve the default legacy schema when the new task is absent. Restore the same checkpoint in a fresh process, repeat that export without targets, and compare the predictions in the original window order. AirAware scores the export against observations from a separate directory. Validate fit candidates with a fixed final step or an inner train-only split; leave the outer calibration, selection and held-out blocks to AirAware. AirAware owns data partitions, calibration, event-level metrics and finalist selection. Keep Lima-specific data and eligibility rules in that repository. The [implementation checklist](todo.md) identifies the tests for each change; the [existing inference guide](../environments/forecast/README.md) documents the entry points.
+
+## Review before merging each PR
+
+At the end of every PR in this plan, review the full diff against the acceptance criteria. Give each of the following reviewers the same base and head commit IDs, the diff, and the test results. Ask each independently for concrete findings, their impact, and a way to verify a fix.
+
+- `model:opencode/zai-coding-plan/glm-5.3-flash`
+- `model:acpRegistry_qwen_code/qwen4-max-preview(openai)`
+- `model:codex/gpt-6.2-sol`
+
+Collect all three responses before merging. Check each finding against the code, implement applicable fixes in the PR, and record how each finding was resolved. Give a brief reason for any suggestion declined. Review the resulting diff, rerun the affected checks, and record the final commit and results in the PR. If a requested review is unavailable, keep it pending and identify the missing reviewer.

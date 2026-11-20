@@ -261,3 +261,41 @@ def test_previous_unpinned_checkpoint_resumes_only_with_same_recipe(tmp_path, he
     assert resume(tmp_path, {**now, "matched_point": "complete_epoch_v1"}, False)[0] is None
     assert resume(tmp_path, {**now, "seed": 28}, False)[0] is None
     assert resume(tmp_path, now, True)[0] is None
+
+
+def test_direct_and_quantile_cli_visit_identical_window_ids(monkeypatch, tmp_path):
+    from runpy import run_path
+    from pathlib import Path
+    import sys
+
+    train = run_path(str(Path(__file__).resolve().parents[2] / "scripts/train_qwen_forecast.py"))
+    ids = np.array(["e", "b", "a", "c", "d"])
+    base = [
+        "train",
+        "--mode",
+        "single",
+        "--batch",
+        "4",
+        "--data",
+        str(tmp_path / "data.npz"),
+        "--weights",
+        str(tmp_path / "weights"),
+        "--run-dir",
+        str(tmp_path / "run"),
+        "--stop-step",
+        "2",
+        "--schedule-steps",
+        "2",
+    ]
+    schedules = {}
+    for head in ("direct", "quantile", "legacy"):
+        opt = ["--head", "quantile"] if head == "quantile" else ["--matched-point"] if head == "direct" else []
+        monkeypatch.setattr(sys, "argv", base + opt)
+        args = train["arguments"]()
+        schedules[head] = [[ids[idx.numpy()].tolist() for idx in train["epoch_order"](ids, args, e).split(args.batch)] for e in (0, 1)]
+        if head != "legacy":
+            assert args.lora and args.validate_at == "final"
+    assert schedules["direct"] == schedules["quantile"]
+    for epoch, legacy in zip(schedules["direct"], schedules["legacy"], strict=True):
+        assert [len(batch) for batch in epoch] == [4, 1]
+        assert sorted(epoch[0] + epoch[1]) == sorted(ids) and epoch[:1] == legacy

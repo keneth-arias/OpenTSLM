@@ -238,13 +238,21 @@ def epoch_batches(rows, batch, *, include_partial):
     return math.ceil(rows / batch) if include_partial else rows // batch
 
 
+def epoch_order(ids, args, epoch):
+    include_partial = bool(args.joint or args.task_schema or args.matched_point)
+    batches = epoch_batches(len(ids), args.batch, include_partial=include_partial)
+    order = torch.randperm(len(ids), generator=torch.Generator().manual_seed(args.seed + epoch))
+    return order[:batches * args.batch]
+
+
 def train(args, rank, world, device):
     if args.task_schema or args.matched_point:
         verify_candidate_input(args.data, args.input_manifest, args.input_manifest_sha256, "fit", args.head, args.thresholds_sha256)
         if args.validation:
             verify_candidate_input(args.validation, args.validation_manifest, args.validation_manifest_sha256, "inner_validation", args.head, args.thresholds_sha256)
     ids, history, targets, thresholds = read_task_data(args.data, args.joint, args.head, args.thresholds_sha256)
-    batches = epoch_batches(len(ids), args.batch, include_partial=bool(args.joint or args.task_schema or args.matched_point))
+    window_order = epoch_order(ids,args,0)
+    batches = math.ceil(len(window_order) / args.batch)
     if batches < 1:
         raise ValueError("One complete training batch is required")
     evaluation = read_task_data(args.validation, args.joint, args.head, args.thresholds_sha256) if args.validation else None
@@ -313,13 +321,14 @@ def train(args, rank, world, device):
     step, best = restore(args.run_dir, model, optimizer, scheduler, args, identity, rank)
     if not step < args.stop_step:
         raise ValueError("Stopping step must advance the restored run")
-    window_order = None
+    current_epoch = 0
     saved_at = time.monotonic()
     for cursor in range(step, args.stop_step):
         epoch, position = divmod(cursor, batches)
-        if position == 0 or window_order is None:
-            window_order = torch.randperm(len(ids), generator=torch.Generator().manual_seed(args.seed + epoch))
-        indices = window_order[position * args.batch : (position + 1) * args.batch]
+        if current_epoch != epoch:
+            window_order = epoch_order(ids,args,epoch)
+            current_epoch = epoch
+        indices = window_order[position * args.batch:(position + 1) * args.batch]
         subset = indices[rank::world]
         x, y = history[subset].to(device), targets[subset].to(device)
         torch.cuda.synchronize()

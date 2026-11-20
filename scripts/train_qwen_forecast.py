@@ -69,6 +69,8 @@ def arguments():
         args.validate_at = "final"
     if args.thresholds_sha256 and args.head != "episode":
         p.error("Only the episode head uses station thresholds")
+    if args.head == "episode" and not args.thresholds_sha256:
+        p.error("Supply --thresholds-sha256 for episode fits")
     args.task_schema = task_schema(args.head, args.thresholds_sha256)
     if bool(args.input_view) != bool(args.scaler):
         p.error("Supply both input view and fitted scaler")
@@ -132,15 +134,20 @@ def save(root, model, optimizer, scheduler, step, identity, rank, best_mae, metr
     dist.barrier()
 
 
+def resume_generation(root, identity, pinned_source):
+    generation = recover(root, identity)
+    if generation is None and "task_schema" not in identity and not pinned_source:
+        previous = {**identity, "trainer": LEGACY_TRAINER_SHA256}
+        generation = recover(root, previous)
+        if generation is not None:
+            return generation, previous["trainer"]
+    return generation, identity["trainer"]
+
+
 def restore(root, model, optimizer, scheduler, args, identity, rank):
     selected = [None, identity["trainer"]]
     if rank == 0 and args.resume:
-        selected[0] = recover(root, identity)
-        if selected[0] is None and "task_schema" not in identity and not os.environ.get("FORECAST_SOURCE_REVISION"):
-            previous = {**identity, "trainer": LEGACY_TRAINER_SHA256}
-            selected[0] = recover(root, previous)
-            if selected[0] is not None:
-                selected[1] = previous["trainer"]
+        selected[:] = resume_generation(root,identity,bool(os.environ.get("FORECAST_SOURCE_REVISION")))
     dist.broadcast_object_list(selected)
     identity["trainer"] = selected[1]
     if selected[0] is None:

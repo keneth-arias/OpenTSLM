@@ -165,3 +165,66 @@ def test_nearly_flat_episode_history_keeps_context_bounded():
     history[1, -1, 0] += 0.001
     logits, _, _ = forecast(ContextOnly(), history, args, torch.tensor([55.0, 55.0]))
     torch.testing.assert_close(logits, torch.tensor([25.0, 100.0]))
+
+
+def test_checkpoint_task_identity_rejects_wrong_transform_levels_head_or_thresholds():
+    from copy import deepcopy
+    from opentslm.forecast import MODEL_REVISION
+    from opentslm.forecast_inference import checkpoint_head, task_schema
+
+    legacy = {"model": MODEL_REVISION, "head": "direct", "precision": "fp32", "lora": True}
+    assert checkpoint_head(legacy, None, None, None) == "direct"
+    for head in ("episode", "quantile"):
+        spec = task_schema(head, "a" * 64)
+        record = {**legacy, "head": head, "task_schema": spec}
+        assert checkpoint_head(record, spec, head, None) == head
+        for field, value in (
+            ("transform", "other"),
+            ("version", 888),
+            ("thresholds_sha256", "f" * 64),
+            ("levels", [0.9, 0.5, 0.1]),
+        ):
+            bad = deepcopy(spec)
+            bad[field] = value
+            with pytest.raises(ValueError):
+                checkpoint_head(record, bad, head, None)
+        with pytest.raises(ValueError):
+            checkpoint_head(record, None, None, None)
+        with pytest.raises(ValueError):
+            checkpoint_head(record, spec, "direct", None)
+
+
+def test_resume_recognizes_only_the_known_legacy_trainer(tmp_path):
+    from opentslm.forecast_checkpoint import publish
+    from runpy import run_path
+    from pathlib import Path
+
+    train = run_path(str(Path(__file__).resolve().parents[2] / "scripts/train_qwen_forecast.py"))
+    recorded = {"head": "direct", "seed": 27, "trainer": train["LEGACY_TRAINER_SHA256"]}
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    (stage / "model.bin").write_bytes(b"model")
+    destination, _ = publish(tmp_path, stage, 12, recorded)
+    current = {**recorded, "trainer": "current"}
+    assert train["resume_generation"](tmp_path, current, False) == ((12, destination), recorded["trainer"])
+    assert train["resume_generation"](tmp_path, {**current, "seed": 28}, False)[0] is None
+    assert train["resume_generation"](tmp_path, current, True)[0] is None
+
+
+def test_interval_validation_includes_last_partial_batch(monkeypatch):
+    from pathlib import Path
+    from runpy import run_path
+
+    trainer = run_path(str(Path(__file__).resolve().parents[2] / "scripts/train_qwen_forecast.py"))
+
+    class Fixed(torch.nn.Module):
+        def forward(self, x, observed):
+            return torch.tensor([0.0, 1.0, 2.0]).expand(len(x), 6, 3)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda values: None)
+    args = SimpleNamespace(head="quantile", precision="fp32", batch=2, joint=None)
+    # Flat zero histories leave these three quantiles in their original units.
+    data = (["a", "b", "c"], torch.zeros(3, 24, 1), torch.tensor([0.0, 1.0, 4.0])[:, None, None].expand(3, 6, 1), None)
+    result = trainer["validation"](Fixed(), data, args, 0, 1, "cpu")
+    assert result["coverage_by_horizon"] == pytest.approx([2 / 3] * 6)
+    assert result["width_by_horizon"] == [2.0] * 6 and result["crossed_by_horizon"] == [0] * 6

@@ -260,6 +260,22 @@ def load_checkpoint_model(model, checkpoint, lora):
     set_model_state_dict(model, state["model"], options=options)
 
 
+def checkpoint_head(identity, schema, head, joint):
+    if identity.get("joint") != (joint.identity() if joint else None):
+        raise ValueError("Checkpoint input view, channels or fitted scaler mismatch")
+    if identity["model"] != MODEL_REVISION or identity["head"] not in FORECASTERS:
+        raise ValueError("Incompatible forecast checkpoint")
+    if identity.get("task_schema") != schema or (head and identity["head"] != head):
+        raise ValueError("Checkpoint task schema or threshold manifest mismatch")
+    if identity["head"] in ("quantile", "episode") and schema is None:
+        raise ValueError("Versioned checkpoints require the matching task schema")
+    if identity["precision"] not in {"fp32", "bf16"}:
+        raise ValueError("Unsupported forecast precision")
+    if type(identity.get("lora")) is not bool or (schema and not identity["lora"]):
+        raise ValueError("Invalid LoRA mode in checkpoint")
+    return identity["head"]
+
+
 def write_predictions(path, ids, shards, checkpoint_sha256=None, joint=None, *, head="direct",
                       input_sha256=None, thresholds_sha256=None, input_manifest_sha256=None):
     indices = np.concatenate([idx for idx, _ in shards])
@@ -277,6 +293,10 @@ def write_predictions(path, ids, shards, checkpoint_sha256=None, joint=None, *, 
     if checkpoint_sha256:
         payload["checkpoint_sha256"] = checkpoint_sha256
     if head in ("episode", "quantile"):
+        if any(not isinstance(v, str) or not re.fullmatch("[a-f0-9]{64}",v) for v in (checkpoint_sha256,input_sha256,input_manifest_sha256)):
+            raise ValueError("Missing candidate export provenance")
+        if head=="episode" and (not isinstance(thresholds_sha256,str) or not re.fullmatch("[a-f0-9]{64}",thresholds_sha256)):
+            raise ValueError("Missing episode threshold digest")
         payload.update(task=head, input_sha256=input_sha256, schema_version=2, model_revision=MODEL_REVISION,
                        input_manifest_sha256=input_manifest_sha256, unit="ug/m3" if head == "quantile" else "logit")
     if head == "episode":
@@ -325,6 +345,8 @@ def main():
         parser.error("Global batch must be a positive multiple of the inference world size")
     if args.output.exists():
         raise FileExistsError(args.output)
+    if args.head == "episode" and not args.thresholds_sha256:
+        parser.error("Supply --thresholds-sha256 for episode inference")
     schema = task_schema(args.head, args.thresholds_sha256)
     if (schema and args.joint) or (args.thresholds_sha256 and args.head != "episode"):
         parser.error("Candidate heads use univariate inputs; only episodes use thresholds")
@@ -334,26 +356,16 @@ def main():
         ids, history = read_history(data, args.joint, require_history_only=args.require_history_only or bool(schema),
                                     episode=args.head == "episode")
         thresholds = episode_thresholds(data, ids, args.thresholds_sha256) if args.head == "episode" else None
+    manifest = read_manifest(args.checkpoint)
+    if manifest is None:
+        raise ValueError("Expected a published checkpoint generation")
+    identity = manifest["identity"]
+    args.head = checkpoint_head(identity, schema, args.head, args.joint)
     device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
     torch.cuda.set_device(device)
     if world > 1:
         dist.init_process_group("nccl", device_id=device)
     try:
-        manifest = read_manifest(args.checkpoint)
-        if manifest is None:
-            raise ValueError("Expected a published checkpoint generation")
-        identity = manifest["identity"]
-        if identity.get("joint") != (args.joint.identity() if args.joint else None):
-            raise ValueError("Checkpoint input view, channels or fitted scaler mismatch")
-        if identity["model"] != MODEL_REVISION or identity["head"] not in FORECASTERS:
-            raise ValueError("Incompatible forecast checkpoint")
-        if identity.get("task_schema") != schema or (args.head and identity["head"] != args.head):
-            raise ValueError("Checkpoint task schema or threshold manifest mismatch")
-        if identity["head"] in ("quantile", "episode") and schema is None:
-            raise ValueError("Versioned checkpoints require the matching task schema")
-        args.head = identity["head"]
-        if identity["precision"] not in {"fp32", "bf16"}:
-            raise ValueError("Unsupported forecast precision")
         sums = args.weights.parent / "SHA256SUMS"
         if rank == 0:
             if manifest["files"] != files(args.checkpoint) or sha256(sums) != identity["weights"]:

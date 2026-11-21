@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Keneth Arias
+# SPDX-License-Identifier: MIT
+# Portions adapted from AWS Samples under MIT-0.
+
 """Replay raw model outputs against a frozen split, including failed questions."""
 
 from collections import Counter, defaultdict

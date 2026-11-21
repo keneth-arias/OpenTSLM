@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Keneth Arias
+# SPDX-License-Identifier: MIT
+# Portions adapted from AWS Samples under MIT-0.
+
 """ARFBench materialization, adapted from AWS's opentslm-finetune-arfbench (MIT-0)."""
 
 from __future__ import annotations

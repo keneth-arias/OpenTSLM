@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Keneth Arias
+# SPDX-License-Identifier: MIT
+# Portions adapted from AWS Samples under MIT-0.
+
 """Execute a frozen QA protocol; training recipe adapted from AWS (MIT-0)."""
 
 import json

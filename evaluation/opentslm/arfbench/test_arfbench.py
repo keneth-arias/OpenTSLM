@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Keneth Arias
+# SPDX-License-Identifier: MIT
+
 """CPU-only fixtures for data selection, predictions and checkpoint adapters."""
 
 import json

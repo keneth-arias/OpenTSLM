@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Keneth Arias
+# SPDX-License-Identifier: MIT
+
 from argparse import ArgumentParser
 import json
 from importlib import metadata

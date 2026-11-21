@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: 2026 Keneth Arias -->
+<!-- SPDX-License-Identifier: MIT -->
+
 # ARFBench QA
 
 From the OpenTSLM repository root, use `python -m evaluation.opentslm.arfbench` for each command below. The benchmark environment uses OpenTSLM, PyTorch and the versions in `requirements.txt`. TimeNet is required only to materialize the release. For legacy runs, install the project's Open Flamingo dependencies, then install `open-flamingo==2.0.1` with `--no-deps` in the benchmark environment. The older 0.0.2 package has a different encoder contract. The legacy Llama backbone requires authorized Hub access or a local snapshot.

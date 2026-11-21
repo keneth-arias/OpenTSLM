@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Keneth Arias
+# SPDX-License-Identifier: MIT
+
 """Checkpoint adapters for prompt-only generation and answer-token training."""
 
 import hashlib

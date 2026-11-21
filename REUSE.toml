@@ -4,3 +4,8 @@ version = 1
 path = ["assets/**", "data/**", "**/*.png", "*.svg", "*.png", "**/*.pt", "**/*.jsonl", "**/*.json", ".gitignore", "**/uv.lock", "LICENSE.md", "**/requirements.txt"]
 SPDX-FileCopyrightText = "2025 Stanford University, ETH Zurich, and the project authors (see CONTRIBUTORS.md)"
 SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = ["src/opentslm/tslm_nov26.sha256"]
+SPDX-FileCopyrightText = "2026 Keneth Arias"
+SPDX-License-Identifier = "MIT"

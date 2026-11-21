@@ -65,3 +65,18 @@ Use `--direct-objective normalized-mse` for the control and `--direct-objective 
 The trainer evaluates the frozen fit sample and inner-validation set at initialization, every 500 updates and at the ceiling. The first eligible checkpoint is at update 500. A decrease in global validation MAE of at least 0.02 µg/m³ updates the selected checkpoint. Four consecutive checks without that decrease stop the fit. Read `direct-result.json` for the actual and selected steps, outcome and both checkpoint digests. `--resume` recovers the most recent complete compatible generation, repairs the selection pointer from its persisted history, and verifies any existing terminal result.
 
 For cooperative shutdown the supervisor sets `EPISODE_STOP_FILE` to an empty, attempt-specific file before starting the trainer. Writing a byte or removing the armed file requests a stop at the next safe point. Before any update, the trainer emits `stopped_before_update`. After saving an interrupted update, it emits `interrupted_at_step` for the supervisor.
+
+## Verify Qwen text mode
+
+The trainer image includes `opentslm.qwen_text`. Mount the shared Qwen base and its sibling `SHA256SUMS`, the pinned tokenizer directory, and the frozen bilingual fixture read-only. The fixture and its reference receipts are kept with the private experiment artifacts. The entry point verifies the base against the same weights manifest used by forecast mode and checks the tokenizer and chat template against the pinned Qwen revision.
+
+Run the following command in the trainer image for CPU input verification.
+
+```sh
+PYTHONPATH=/opt/forecast/src /opt/conda/bin/python -m opentslm.qwen_text \
+  --base /base/weights \
+  --base-manifest-sha256 1d76cc3cfd4c15f9c749372611e5ca6e0b6f910b1fcf0551ce9157e9bfef29c1 \
+  --tokenizer /tokenizer --fixture /fixture.json --verify-only
+```
+
+For a language receipt, replace `--verify-only` with `--output /result/receipt.json --device cuda:0` in the managed GPU workload. Use the same image, GPU type and precision for duplicate base runs and both sides of the text → forecast → text check. The receipt records prompt, greedy continuation and fixed reference token IDs plus causal negative log likelihood for every reference token. Text mode loads the Qwen generation model in FP32, uses the pinned chat template with thinking disabled, and leaves forecast adapter loading to `opentslm.forecast_inference` in its own process.

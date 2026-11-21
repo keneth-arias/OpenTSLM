@@ -4,6 +4,7 @@
 
 import hashlib
 import json
+import os
 import uuid
 from pathlib import Path
 
@@ -21,9 +22,21 @@ def files(directory):
     }
 
 
+def sync_path(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def publish(root, staging, step, identity):
     manifest = {"step": step, "identity": identity, "files": files(staging)}
     (staging / "manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n")
+    for directory, _, names in os.walk(staging, topdown=False):
+        for name in names:
+            sync_path(Path(directory) / name)
+        sync_path(directory)
     final = root / f"step-{step:08d}"
     if final.exists():
         existing = read_manifest(final)
@@ -38,7 +51,9 @@ def publish(root, staging, step, identity):
 def point_to(root, name, final):
     pointer = root / f".{name}.tmp"
     pointer.write_text(final.name + "\n")
+    sync_path(pointer)
     pointer.replace(root / name)
+    sync_path(root)
 
 
 def read_manifest(path):
@@ -57,3 +72,42 @@ def recover(root: Path, identity):
         if manifest and manifest["identity"] == identity and manifest["files"] == files(path):
             return manifest["step"], path
     return None
+
+
+def selected_generation(root, identity, best_step):
+    """Reconcile the best pointer from the latest durable evaluation history."""
+    selected = root / f"step-{best_step:08d}"
+    info = read_manifest(selected)
+    if not info or info["identity"] != identity or files(selected) != info["files"]:
+        raise ValueError("Selected direct checkpoint is missing, damaged or belongs to another run")
+    point_to(root, "best", selected)
+    return selected
+
+
+def finish_direct(root, identity, latest_step, history):
+    """Publish one idempotent receipt after checking both restorable generations."""
+    last = history[-1]
+    if last["step"] != latest_step or last["outcome"] not in ("early-stopped", "completed"):
+        raise ValueError("Training has no terminal evaluation")
+    selected = selected_generation(root, identity, last["best_step"])
+    latest = root / f"step-{latest_step:08d}"
+    if latest != selected:
+        info = read_manifest(latest)
+        if not info or info["identity"] != identity or files(latest) != info["files"]:
+            raise ValueError("Terminal checkpoint is missing or damaged")
+    receipt = {**last, "identity": identity,
+               "selected_manifest_sha256": sha256(selected / "manifest.json"),
+               "latest_manifest_sha256": sha256(latest / "manifest.json")}
+    from tempfile import NamedTemporaryFile
+    with NamedTemporaryFile(dir=root, mode="w") as tmp:
+        json.dump(receipt, tmp, sort_keys=True, allow_nan=False)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        path = root / "direct-result.json"
+        try:
+            os.link(tmp.name, path)
+            sync_path(root)
+        except FileExistsError:
+            if json.loads(path.read_bytes()) != receipt:
+                raise ValueError("Existing terminal result belongs to a different fit")
+    return receipt

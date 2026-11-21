@@ -13,6 +13,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 import numpy as np
+from opentslm.forecast_inputs import verify_candidate_input, verify_weight_snapshot
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
@@ -127,35 +128,6 @@ def task_schema(head, threshold_hash=None):
     else:
         schema.update(levels=list(QUANTILES), target="hourly_concentration_h1_h6_v1")
     return schema
-
-
-def verify_candidate_input(data_path, manifest_path, expected_digest, phase, head, threshold_hash):
-    """Verify the phase artifact and independently join frozen station thresholds."""
-    if not manifest_path or not expected_digest or sha256(manifest_path) != expected_digest:
-        raise ValueError("Expected the pinned candidate input manifest")
-    spec = json.loads(manifest_path.read_text())
-    if (spec.get("schema"), spec.get("unit"), spec.get("phase"), spec.get("head")) != (
-        "forecast-input-v1", "ug/m3", phase, head
-    ):
-        raise ValueError("Candidate input phase, head, units or schema mismatch")
-    if spec.get("files", {}).get(data_path.name) != sha256(data_path):
-        raise ValueError("Input archive checksum mismatch")
-    if head == "episode":
-        source = manifest_path.parent / "thresholds.json"
-        if (source.is_symlink() or spec.get("thresholds_sha256") != threshold_hash
-                or spec["files"].get(source.name) != threshold_hash or sha256(source) != threshold_hash):
-            raise ValueError("Frozen station threshold manifest mismatch")
-        table = json.loads(source.read_text())
-        if table.get("unit") != "ug/m3" or not isinstance(table.get("stations"), dict):
-            raise ValueError("Invalid station threshold units or table")
-        with np.load(data_path, allow_pickle=False) as rows:
-            stations = rows["station_key"]
-            if stations.dtype.kind != "U" or stations.shape != rows["window_id"].shape:
-                raise ValueError("Invalid station keys for threshold lookup")
-            expected = np.array([table["stations"].get(station, np.nan) for station in stations], dtype=float)
-            if (not np.isfinite(expected).all() or not np.array_equal(expected, rows["threshold_ug_m3"])
-                    or rows["thresholds_sha256"].item() != threshold_hash):
-                raise ValueError("Station threshold differs from the frozen table")
 
 
 def episode_thresholds(data, ids, expected_hash):
@@ -366,15 +338,10 @@ def main():
     if world > 1:
         dist.init_process_group("nccl", device_id=device)
     try:
-        sums = args.weights.parent / "SHA256SUMS"
         if rank == 0:
-            if manifest["files"] != files(args.checkpoint) or sha256(sums) != identity["weights"]:
-                raise ValueError("Training checkpoint or base snapshot checksum mismatch")
-            listed = {line.split(maxsplit=1)[1].removeprefix("*") for line in sums.read_text().splitlines()}
-            actual = {str(p.relative_to(args.weights.parent)) for p in args.weights.rglob("*") if p.is_file()}
-            if not actual or actual != listed:
-                raise ValueError("Weight directory does not match the snapshot manifest")
-            subprocess.run(["sha256sum", "--strict", "--check", sums.name], cwd=sums.parent, check=True)
+            if manifest["files"] != files(args.checkpoint):
+                raise ValueError("Training checkpoint checksum mismatch")
+            verify_weight_snapshot(args.weights, identity["weights"])
         if world > 1:
             dist.barrier()
         forecaster = FORECASTERS[args.head]

@@ -33,6 +33,7 @@ from torch.nn.parallel import DistributedDataParallel
 LEGACY_TRAINER_SHA256 = "4a17f9f4a9efc393767cfa0d42d89bd29165bae9794bcefa0e4bf1006e6dd9db"
 
 
+PRE_FLAMINGO_TRAINER_SHA256 = "26b418ee1aad96966d5fb55db13ad3c9a1848962e24904f9cbe162d88454889f"
 PARENT_TRAINER_SHA256 = "e4a32f79f1533d2583c71f3b74619bd36202b532197f62bcf74f95ef0339e920"
 
 PREVIOUS_TRAINER_SHA256 = "88beb175c7c0e4dec8480d9cd1d9fd10b5b2619cad6d377ef1337f73ecc0642e"
@@ -183,7 +184,7 @@ def resume_generation(root, identity, pinned_source):
     generation = recover(root, identity)
     if generation is not None or pinned_source or "matched_point" in identity or "direct_objective" in identity:
         return generation, identity["trainer"]
-    compatible = [PARENT_TRAINER_SHA256, PREVIOUS_TRAINER_SHA256]
+    compatible = [PRE_FLAMINGO_TRAINER_SHA256, PARENT_TRAINER_SHA256, PREVIOUS_TRAINER_SHA256]
     if "task_schema" not in identity:
         compatible.append(LEGACY_TRAINER_SHA256)
     for revision in compatible:

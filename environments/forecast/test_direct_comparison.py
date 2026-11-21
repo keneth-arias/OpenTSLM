@@ -124,11 +124,29 @@ def test_resume_repairs_best_and_publishes_one_terminal_result(tmp_path):
     assert history[-1]["patience"] == 4 and history[-1]["outcome"] == "early-stopped"
     (tmp_path / "best").write_text("step-00000500")
     selected_generation(tmp_path, identity, history[-1]["best_step"])
+    with pytest.raises(ValueError, match="no valid selected update"):
+        finish_direct(tmp_path, identity, 3000, [{**history[-1], "best_step": None}])
+    assert not (tmp_path / "direct-result.json").exists()
     first = finish_direct(tmp_path, identity, 3000, history)
     assert (tmp_path / "best").read_text().strip() == "step-00001000"
     assert finish_direct(tmp_path, identity, 3000, history) == first
     with pytest.raises(ValueError, match="another run"):
         finish_direct(tmp_path, dict(identity, seed=28), 3000, history)
+
+
+@pytest.mark.parametrize("metadata", [None, "not-json", "{}", '{"evaluations":[]}', '{"evaluations":[{"best_step":1001}]}'])
+def test_recovery_skips_intact_but_unusable_direct_metadata(tmp_path, metadata):
+    from opentslm.forecast_checkpoint import recover
+
+    identity = {"direct_objective": "physical-mae"}
+    for step, contents in ((500, '{"evaluations":[{"best_step":500}]}'), (1000, metadata)):
+        stage = tmp_path / ".saving"
+        stage.mkdir()
+        (stage / "shard").write_bytes(b"synthetic")
+        if contents is not None:
+            (stage / "training.pt.json").write_text(contents)
+        publish(tmp_path, stage, step, identity)
+    assert recover(tmp_path, identity) == (500, tmp_path / "step-00000500")
 
 
 def test_rotation_keeps_selected_checkpoint_for_fallback(tmp_path):

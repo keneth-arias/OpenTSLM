@@ -15,6 +15,7 @@ from .forecast_inference import forecast
 OBJECTIVES = ("normalized-mse", "physical-mae")
 EVAL_INTERVAL = 500
 PATIENCE = 4
+MIN_IMPROVEMENT = Decimal("0.02")
 
 
 def selection(history, step, mae, ceiling):
@@ -27,7 +28,7 @@ def selection(history, step, mae, ceiling):
     best_step, best = previous.get("best_step"), previous.get("best_mae")
     patience = previous.get("patience", 0)
     if step >= EVAL_INTERVAL:
-        if best is None or Decimal(str(best)) - Decimal(str(mae)) >= Decimal("0.02"):
+        if best is None or Decimal(str(best)) - Decimal(str(mae)) >= MIN_IMPROVEMENT:
             best_step, best, patience = step, mae, 0
         else:
             patience += 1

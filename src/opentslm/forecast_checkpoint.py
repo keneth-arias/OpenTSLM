@@ -76,8 +76,13 @@ def direct_dependencies(path, identity):
     """Return both directories needed to resume this intact direct generation."""
     if not intact(path, identity):
         return set()
-    metadata = json.loads((path / "training.pt.json").read_bytes())
-    best_step = metadata["evaluations"][-1]["best_step"]
+    try:
+        metadata = json.loads((path / "training.pt.json").read_bytes())
+        best_step = metadata["evaluations"][-1]["best_step"]
+    except (FileNotFoundError, ValueError, KeyError, IndexError, TypeError):
+        return set()
+    if best_step is not None and (type(best_step) is not int or not 0 < best_step <= int(path.name[5:])):
+        return set()
     needed = {path}
     if best_step is not None:
         best = path.parent / f"step-{best_step:08d}"
@@ -153,7 +158,10 @@ def finish_direct(root, identity, latest_step, history):
     last = history[-1]
     if last["step"] != latest_step or last["outcome"] not in ("early-stopped", "completed"):
         raise ValueError("Training has no terminal evaluation")
-    selected = selected_generation(root, identity, last["best_step"])
+    best_step = last.get("best_step")
+    if type(best_step) is not int or not 0 < best_step <= latest_step:
+        raise ValueError("Terminal evaluation has no valid selected update")
+    selected = selected_generation(root, identity, best_step)
     latest = root / f"step-{latest_step:08d}"
     if latest != selected:
         info = read_manifest(latest)

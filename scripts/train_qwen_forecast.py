@@ -328,7 +328,7 @@ def train(args, rank, world, device):
         identity.update(direct_objective=args.direct_objective, logical_run=args.logical_run,
                         input_manifest_sha256=args.input_manifest_sha256, validation_manifest_sha256=args.validation_manifest_sha256,
                         evaluation_interval=forecast_direct.EVAL_INTERVAL, patience_checks=forecast_direct.PATIENCE,
-                        min_improvement_ug_m3="0.02", optimizer={"name": "AdamW", "lr": 1e-4, "weight_decay": 0,
+                        min_improvement_ug_m3=str(forecast_direct.MIN_IMPROVEMENT), optimizer={"name": "AdamW", "lr": 1e-4, "weight_decay": 0,
                             "gradient_clip": 1.0, "scheduler": "cosine", "lora_rank": 4, "lora_alpha": 8})
         recipe = {k: v for k, v in identity.items() if k != "logical_run"}
         identity["recipe_sha256"] = hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()

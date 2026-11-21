@@ -14,12 +14,12 @@ from opentslm.forecast_direct import evaluate_direct, selection
 from opentslm.forecast_inputs import direct_cohorts
 
 
-def make_cohorts(root, weights, fit_count=32, validation_count=3):
+def make_cohorts(root, weights, fit_count=32, validation_count=3, gap=40, extra_sample=0):
     """Only synthetic measurements, with non-overlapping time intervals."""
     pins = []
     for phase, count, offset in (
         ("fit", fit_count, 0),
-        ("inner_validation", validation_count, fit_count + 40),
+        ("inner_validation", validation_count, fit_count + gap),
     ):
         path = root / phase
         path.mkdir(parents=True)
@@ -36,7 +36,7 @@ def make_cohorts(root, weights, fit_count=32, validation_count=3):
             targets=np.tile(np.arange(20, 26, dtype=np.float32), (count, 1)),
         )
         if phase == "fit":
-            rows["graph_sample"] = np.arange(count) < validation_count
+            rows["graph_sample"] = np.arange(count) < validation_count + extra_sample
         np.savez(path / "data.npz", **rows)
         (path / "thresholds.json").write_text(
             json.dumps(
@@ -74,6 +74,13 @@ def test_pair_requires_separately_pinned_roles(tmp_path):
         direct_cohorts(*pins[2:], *pins[:2], "a" * 64)
     (pins[0].parent / "thresholds.json").write_text("{}")
     with pytest.raises(ValueError, match="Corrupt"):
+        direct_cohorts(*pins, "a" * 64)
+
+
+@pytest.mark.parametrize("options,message", [({"gap": 28}, "overlap"), ({"extra_sample": 1}, "graph sample")])
+def test_pinned_cohorts_reject_a_shared_hour_or_extra_graph_row(tmp_path, options, message):
+    pins = make_cohorts(tmp_path, "a" * 64, **options)
+    with pytest.raises(ValueError, match=message):
         direct_cohorts(*pins, "a" * 64)
 
 
@@ -134,12 +141,19 @@ def test_resume_repairs_best_and_publishes_one_terminal_result(tmp_path):
         finish_direct(tmp_path, dict(identity, seed=28), 3000, history)
 
 
-@pytest.mark.parametrize("metadata", [None, "not-json", "{}", '{"evaluations":[]}', '{"evaluations":[{"best_step":1001}]}'])
+def resume_metadata(step, best):
+    return {"scheduler": {}, "evaluations": [dict(step=step, best_step=best, best_mae=1., patience=0,
+                                                   outcome="running", next_eval_step=step + 500)]}
+
+
+@pytest.mark.parametrize("metadata", [None, "not-json", "{}", '{"evaluations":[]}', json.dumps(resume_metadata(1000, 1001)),
+    json.dumps({"scheduler": {}, "evaluations": [{**resume_metadata(1000, 500)["evaluations"][0],
+               "best_step": None, "best_mae": None, "next_eval_step": None, "outcome": "completed"}]})])
 def test_recovery_skips_intact_but_unusable_direct_metadata(tmp_path, metadata):
     from opentslm.forecast_checkpoint import recover
 
     identity = {"direct_objective": "physical-mae"}
-    for step, contents in ((500, '{"evaluations":[{"best_step":500}]}'), (1000, metadata)):
+    for step, contents in ((500, json.dumps(resume_metadata(500, 500))), (1000, metadata)):
         stage = tmp_path / ".saving"
         stage.mkdir()
         (stage / "shard").write_bytes(b"synthetic")
@@ -156,7 +170,7 @@ def test_rotation_keeps_selected_checkpoint_for_fallback(tmp_path):
     for step, best in [(500, 500), (1000, 500), (1500, 1500)]:
         partial = tmp_path / ".saving"
         partial.mkdir()
-        metadata = {"evaluations": [{"step": step, "best_step": best}]}
+        metadata = resume_metadata(step, best)
         (partial / "training.pt.json").write_text(json.dumps(metadata))
         final, _ = publish(tmp_path, partial, step, identity)
         rotate_direct(tmp_path, identity, final)
@@ -208,7 +222,7 @@ def test_damaged_shared_best_replays_past_abandoned_future(tmp_path, rotate_befo
     def checkpoint(step, best):
         partial = tmp_path / ".pending"
         partial.mkdir()
-        metadata = {"evaluations": [{"step": step, "best_step": best}]}
+        metadata = resume_metadata(step, best)
         (partial / "training.pt.json").write_text(json.dumps(metadata))
         return publish(tmp_path, partial, step, identity)[0]
 
@@ -245,3 +259,51 @@ def test_allocator_budget_is_opt_in(monkeypatch):
     monkeypatch.setenv("FORECAST_GPU_LIMIT_BYTES", str(2**30))
     configure_device(0)
     fraction.assert_called_once_with(0.25, 0)
+
+
+def test_direct_trainer_saves_and_restores_terminal_selection(tmp_path, monkeypatch):
+    import runpy
+    from pathlib import Path
+
+    trainer = runpy.run_path(str(Path(__file__).resolve().parents[2] / "scripts/train_qwen_forecast.py"))
+    monkeypatch.setattr(torch.distributed, "broadcast_object_list", lambda *_: None)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+    monkeypatch.setattr(torch.cuda, "get_rng_state", torch.get_rng_state)
+    monkeypatch.setattr(torch.cuda, "set_rng_state", lambda _: None)
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters())
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1500)
+    identity = dict(trainer="synthetic", lora=False, direct_objective="physical-mae")
+    history = []
+    for step in (0, 500, 1000, 1500):
+        history.append(selection(history, step, 1., 1500))
+        if step:
+            optimizer.zero_grad()
+            model(torch.ones(1, 2)).sum().backward()
+            optimizer.step()
+            scheduler.step()
+            trainer["save"](tmp_path, model, optimizer, scheduler, step, identity, 0, 1., 1., history)
+            assert (tmp_path / "best").read_text().strip() == "step-00000500"
+    expected = model.weight.detach().clone()
+    with torch.no_grad():
+        model.weight.zero_()
+    receipt = finish_direct(tmp_path, identity, 1500, history)
+    args = SimpleNamespace(resume=True, direct_objective="physical-mae")
+    restored, best, events = trainer["restore"](tmp_path, model, optimizer, scheduler, args, identity, 0)
+    assert (restored, best, events) == (1500, 1., history)
+    assert finish_direct(tmp_path, identity, restored, events) == receipt
+    torch.testing.assert_close(model.weight, expected)
+
+
+def test_missing_armed_stop_file_requests_shutdown(tmp_path):
+    import runpy
+    from pathlib import Path
+
+    trainer = runpy.run_path(str(Path(__file__).resolve().parents[2] / "scripts/train_qwen_forecast.py"))
+    request = tmp_path / "stop"
+    request.touch()
+    assert not trainer["stop_marked"](request)
+    request.write_bytes(b"1")
+    assert trainer["stop_marked"](request)
+    request.unlink()
+    assert trainer["stop_marked"](request)

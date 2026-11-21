@@ -281,6 +281,14 @@ def epoch_order(ids, args, epoch):
     return order[:batches * args.batch]
 
 
+def stop_marked(path):
+    # A vanished armed channel should stop the worker at its next safe point.
+    try:
+        return Path(path).stat().st_size > 0
+    except FileNotFoundError:
+        return True
+
+
 def train(args, rank, world, device):
     if args.task_schema or args.matched_point:
         verify_candidate_input(args.data, args.input_manifest, args.input_manifest_sha256, "fit", args.head, args.thresholds_sha256)
@@ -350,7 +358,7 @@ def train(args, rank, world, device):
     def stop_requested():
         if not stop_file:
             return False
-        flag = torch.tensor(bool(rank == 0 and Path(stop_file).stat().st_size), device=device)
+        flag = torch.tensor(bool(rank == 0 and stop_marked(stop_file)), device=device)
         dist.broadcast(flag, src=0)
         return flag.item()
 
@@ -450,7 +458,7 @@ def train(args, rank, world, device):
         step = cursor + 1
         action = 0
         if rank == 0:
-            if stop_file and step < args.stop_step and Path(stop_file).stat().st_size:
+            if stop_file and step < args.stop_step and stop_marked(stop_file):
                 action = 2  # Publish this step and leave on all ranks.
             elif step == args.stop_step or (cohorts and step == evaluations[-1]["next_eval_step"]) or time.monotonic() - saved_at >= args.save_seconds:
                 action = 1

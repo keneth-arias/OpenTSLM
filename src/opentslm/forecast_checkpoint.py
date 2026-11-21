@@ -4,6 +4,7 @@
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import uuid
@@ -78,10 +79,27 @@ def direct_dependencies(path, identity):
         return set()
     try:
         metadata = json.loads((path / "training.pt.json").read_bytes())
-        best_step = metadata["evaluations"][-1]["best_step"]
+        last = metadata["evaluations"][-1]
+        step = int(path.name.removeprefix("step-"))
+        evaluated, outcome = last["step"], last["outcome"]
+        best_step, best_mae = last["best_step"], last["best_mae"]
+        next_step, patience = last["next_eval_step"], last["patience"]
+        if not isinstance(metadata["scheduler"], dict) or type(evaluated) is not int or not 0 <= evaluated <= step:
+            return set()
+        if type(patience) is not int or patience < 0:
+            return set()
+        if outcome == "running":
+            if type(next_step) is not int or next_step <= step:
+                return set()
+        elif outcome not in ("completed", "early-stopped") or next_step is not None or evaluated != step:
+            return set()
+        if best_step is None:
+            if evaluated != 0 or outcome != "running" or best_mae is not None:
+                return set()
+        elif (type(best_step) is not int or not 0 < best_step <= evaluated
+              or type(best_mae) not in (int, float) or not math.isfinite(best_mae) or best_mae < 0):
+            return set()
     except (FileNotFoundError, ValueError, KeyError, IndexError, TypeError):
-        return set()
-    if best_step is not None and (type(best_step) is not int or not 0 < best_step <= int(path.name[5:])):
         return set()
     needed = {path}
     if best_step is not None:

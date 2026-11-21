@@ -4,14 +4,17 @@
 
 import torch
 from torch import Tensor, nn
-from transformers import Qwen3_5ForConditionalGeneration, Qwen3_5TextModel
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from transformers import Qwen3_5TextModel
 
 MODEL_ID = "Qwen/Qwen3.5-0.8B"
 MODEL_REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
 
 
 class QwenForecaster(nn.Module):
-    def __init__(self, decoder: Qwen3_5TextModel, *, channels=1, targets=1, horizon=6, patch_size=4):
+    def __init__(self, decoder: "Qwen3_5TextModel", *, channels=1, targets=1, horizon=6, patch_size=4):
         super().__init__()
         if min(channels, targets, horizon, patch_size) < 1:
             raise ValueError("Forecast dimensions must be positive")
@@ -28,6 +31,8 @@ class QwenForecaster(nn.Module):
 
     @classmethod
     def from_pretrained(cls, *, local_files_only=False, checkpoint_path=None, **dimensions):
+        from transformers import Qwen3_5ForConditionalGeneration
+
         checkpoint, report = Qwen3_5ForConditionalGeneration.from_pretrained(
             checkpoint_path or MODEL_ID,
             revision=None if checkpoint_path else MODEL_REVISION,
@@ -62,7 +67,7 @@ class QwenForecaster(nn.Module):
 class PersistenceForecaster(QwenForecaster):
     """Univariate forecasts anchored to the observed value at the forecast origin."""
 
-    def __init__(self, decoder: Qwen3_5TextModel, *, horizon=6, patch_size=4):
+    def __init__(self, decoder: "Qwen3_5TextModel", *, horizon=6, patch_size=4):
         super().__init__(decoder, horizon=horizon, patch_size=patch_size)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)

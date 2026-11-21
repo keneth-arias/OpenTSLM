@@ -19,6 +19,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, set_model_state_dict
 
+from opentslm import flamingo_forecast
 from opentslm.forecast import FORECASTERS, MODEL_REVISION, QUANTILES
 from opentslm.forecast_checkpoint import files, read_manifest, sha256
 
@@ -216,7 +217,10 @@ def forecast(model, history, args, thresholds=None):
             observed[:, :, 1] = False
         normalized = (torch.where(observed, history, center) - center) / scale
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.precision == "bf16"):
-        if getattr(args, "head", None) == "episode":
+        if getattr(args, "backbone", "qwen") == "flamingo":
+            # The checkpoint derives its own observed-value statistics from raw PM2.5.
+            predicted = model(history, observed)
+        elif getattr(args, "head", None) == "episode":
             context = ((thresholds - center.flatten()) / scale.flatten()).clamp(-MAX_THRESHOLD_STD, MAX_THRESHOLD_STD)
             predicted = model(normalized, observed, context)
         else:
@@ -241,7 +245,10 @@ def forecast_batches(model, history, args, rank, world, device, thresholds=None)
 
 def load_checkpoint_model(model, checkpoint, lora):
     options = state_options(lora)
-    state = {"model": get_model_state_dict(model, options=options)}
+    params = get_model_state_dict(model, options=options)
+    if isinstance(model, flamingo_forecast.FlamingoForecaster):
+        params = model.adapter_state(params)
+    state = {"model": params}
     # Each inference worker loads a replica. DCP reads full and sharded training states.
     dcp.load(state, checkpoint_id=checkpoint / "dcp", no_dist=True)
     set_model_state_dict(model, state["model"], options=options)
@@ -250,7 +257,13 @@ def load_checkpoint_model(model, checkpoint, lora):
 def checkpoint_head(identity, schema, head, joint):
     if identity.get("joint") != (joint.identity() if joint else None):
         raise ValueError("Checkpoint input view, channels or fitted scaler mismatch")
-    if identity["model"] != MODEL_REVISION or identity["head"] not in FORECASTERS:
+    if identity.get("backbone") == "flamingo":
+        if (identity["model"] != flamingo_forecast.MODEL_REVISION or identity["head"] != "direct"
+                or identity.get("forecast_schema") != flamingo_forecast.forecast_schema()
+                or identity.get("weights") != flamingo_forecast.WEIGHTS_MANIFEST_SHA256
+                or identity.get("precision") != "fp32" or identity.get("lora") is not True or joint):
+            raise ValueError("Incompatible Flamingo forecast schema")
+    elif identity.get("backbone", "qwen") != "qwen" or identity["model"] != MODEL_REVISION or identity["head"] not in FORECASTERS:
         raise ValueError("Incompatible forecast checkpoint")
     if identity.get("task_schema") != schema or (head and identity["head"] != head):
         raise ValueError("Checkpoint task schema or threshold manifest mismatch")
@@ -324,6 +337,8 @@ def main():
     parser.add_argument(
         "--require-history-only", action="store_true", help="Reject fields outside the history input schema"
     )
+    parser.add_argument("--flamingo-receipt", type=Path, help="Terminal direct-result.json for the selected Flamingo fit")
+    parser.add_argument("--flamingo-receipt-sha256")
     parser.add_argument("--parity-history", action="store_true",
                         help="Use the frozen univariate language-parity history and bind its digest to the output")
     args = parser.parse_args()
@@ -346,39 +361,56 @@ def main():
     if schema:
         verify_candidate_input(args.data, args.input_manifest, args.input_manifest_sha256, "infer", args.head, args.thresholds_sha256)
     source = args.data
-    parity_hash = None
+    history_digest = None
     if args.parity_history:
         from opentslm.qwen_text_parity import HISTORY_SHA256, frozen_history
 
         source = io.BytesIO(frozen_history(source))
-        parity_hash = HISTORY_SHA256
-    with np.load(source, allow_pickle=False) as data:
-        ids, history = read_history(data, args.joint, require_history_only=args.require_history_only or args.parity_history or bool(schema),
-                                    episode=args.head == "episode")
-        thresholds = episode_thresholds(data, ids, args.thresholds_sha256) if args.head == "episode" else None
+        history_digest = HISTORY_SHA256
     manifest = read_manifest(args.checkpoint)
     if manifest is None:
         raise ValueError("Expected a published checkpoint generation")
     identity = manifest["identity"]
     args.head = checkpoint_head(identity, schema, args.head, args.joint)
+    args.backbone = identity.get("backbone", "qwen")
+    is_flamingo = args.backbone == "flamingo"
+    if is_flamingo and not (args.flamingo_receipt and args.flamingo_receipt_sha256):
+        parser.error("Flamingo inference requires the selected fit receipt and its SHA-256")
+    if not is_flamingo and (args.flamingo_receipt or args.flamingo_receipt_sha256):
+        parser.error("Flamingo receipts require a Flamingo checkpoint")
+    if is_flamingo and history_digest is None:
+        payload = source.read_bytes()
+        history_digest = hashlib.sha256(payload).hexdigest()
+        source = io.BytesIO(payload)
+    with np.load(source, allow_pickle=False) as data:
+        ids, history = read_history(data, args.joint, require_history_only=is_flamingo or args.require_history_only or args.parity_history or bool(schema),
+                                    episode=args.head == "episode")
+        thresholds = episode_thresholds(data, ids, args.thresholds_sha256) if args.head == "episode" else None
     device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
     configure_device(device)
     if world > 1:
         dist.init_process_group("nccl", device_id=device)
     try:
-        if rank == 0:
-            if manifest["files"] != files(args.checkpoint):
-                raise ValueError("Training checkpoint checksum mismatch")
-            verify_weight_snapshot(args.weights, identity["weights"])
-        if world > 1:
-            dist.barrier()
-        forecaster = FORECASTERS[args.head]
-        dimensions = {"channels": 2, "targets": 2} if args.joint else {}
-        model = forecaster.from_pretrained(checkpoint_path=str(args.weights), local_files_only=True, **dimensions)
-        if identity["lora"]:
-            add_lora(model)
-        load_checkpoint_model(model, args.checkpoint, identity["lora"])
-        model.to(device).eval()
+        if is_flamingo:
+            model = flamingo_forecast.restore_selected(
+                args.weights, args.checkpoint, args.flamingo_receipt, device=device,
+                expected_receipt_sha256=args.flamingo_receipt_sha256,
+            )
+        else:
+            if rank == 0:
+                if manifest["files"] != files(args.checkpoint):
+                    raise ValueError("Training checkpoint checksum mismatch")
+                verify_weight_snapshot(args.weights, identity["weights"])
+            if world > 1:
+                dist.barrier()
+            dimensions = {"channels": 2, "targets": 2} if args.joint else {}
+            model = FORECASTERS[args.head].from_pretrained(
+                checkpoint_path=str(args.weights), local_files_only=True, **dimensions
+            )
+            if identity["lora"]:
+                add_lora(model)
+            load_checkpoint_model(model, args.checkpoint, identity["lora"])
+            model.to(device).eval()
         args.precision = identity["precision"]
         indices, values = [], []
         for idx, prediction in forecast_batches(model, history, args, rank, world, device, thresholds):
@@ -392,7 +424,7 @@ def main():
         if rank == 0:
             digest = sha256(args.checkpoint / "manifest.json")
             write_predictions(args.output, ids, shards, digest, args.joint, head=args.head,
-                              input_sha256=sha256(args.data) if schema else parity_hash,
+                              input_sha256=sha256(args.data) if schema else history_digest,
                               thresholds_sha256=args.thresholds_sha256, input_manifest_sha256=args.input_manifest_sha256)
             print(json.dumps({"windows": len(ids), "checkpoint_sha256": digest, "output_sha256": sha256(args.output)}))
     finally:

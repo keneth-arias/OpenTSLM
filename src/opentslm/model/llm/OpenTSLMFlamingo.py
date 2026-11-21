@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: MIT
 
 from types import SimpleNamespace
+from zipfile import is_zipfile
 from opentslm.model.encoder.CNNTokenizer import CNNTokenizer
 from opentslm.model.llm.TimeSeriesFlamingoWithTrainableEncoder import (
     TimeSeriesFlamingoWithTrainableEncoder,
@@ -43,6 +44,8 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
         cross_attn_every_n_layers: int = 1,
         decoder_layers_attr_name: str = None,
         freeze_lm_embeddings: bool = False,
+        base_revision: str | None = None,
+        cache_dir: str | None = None,
         **flamingo_kwargs,
     ):
         super().__init__(device)
@@ -53,14 +56,16 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
             llm_id,
             local_files_only=False,
             trust_remote_code=True,
-            cache_dir=None,
+            cache_dir=cache_dir,
+            revision=base_revision,
         )
 
         lang_encoder = AutoModelForCausalLM.from_pretrained(
             llm_id,
             local_files_only=False,
             trust_remote_code=True,
-            cache_dir=None,
+            cache_dir=cache_dir,
+            revision=base_revision,
             device_map={"": device},
             attn_implementation="eager",
         )
@@ -307,44 +312,29 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
         torch.save(state_dict, path)
         print(f"Model saved to {path}")
 
-    def load_from_file(self, path: str = "best_model.pt"):
-        """
-        Load model parameters with non-strict loading to handle Flamingo-specific layers.
-        """
-        checkpoint = torch.load(path, map_location=self.device)
-
-        if "llm" in checkpoint:
-            model_state = checkpoint["llm"]
-        elif "model_state" in checkpoint:
-            model_state = checkpoint["model_state"]
-        else:
-            raise RuntimeError("No recognized model state key in checkpoint.")
-
-        # Handle DDP (DistributedDataParallel) if needed
-        if hasattr(self, "module"):
-            model_state = {f"module.{k}": v for k, v in model_state.items()}
-
-        # Remove 'model.' prefix if present in checkpoint keys
-        if all(k.startswith("model.") for k in model_state.keys()):
-            model_state = {
-                k.replace("model.", "", 1): v for k, v in model_state.items()
-            }
-
-        # Load state dict with strict=False to handle missing/unexpected keys
-        missing_keys, unexpected_keys = self.load_state_dict(model_state, strict=False)
-        if missing_keys:
-            print(f"⚠️  Warning: Missing keys when loading checkpoint:")
-            for key in missing_keys[:10]:
-                print(f"   - {key}")
-            if len(missing_keys) > 10:
-                print(f"   ... and {len(missing_keys) - 10} more keys")
-        if unexpected_keys:
-            print(f"⚠️  Warning: Unexpected keys when loading checkpoint:")
-            for key in unexpected_keys[:10]:
-                print(f"   - {key}")
-            if len(unexpected_keys) > 10:
-                print(f"   ... and {len(unexpected_keys) - 10} more keys")
-        self.to(self.device)
+    def load_from_file(self, path: str = "best_model.pt", *, verify_weights: bool = False):
+        """Restore inner-model exports or curriculum checkpoints, including DDP names."""
+        # Curriculum archives also contain optimizer state. Keep it off the accelerator.
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True, mmap=is_zipfile(path))
+        state = checkpoint.get("llm", checkpoint.get("model_state"))
+        if not isinstance(state, dict):
+            raise ValueError("Expected a Flamingo checkpoint with llm or model_state")
+        state = {key.removeprefix("module."): value for key, value in state.items()}
+        # The training wrapper registers the same Flamingo as both 'model' and 'llm'.
+        # store_to_file writes just the inner module. Align both layouts to that module.
+        if any(key.startswith("model.") for key in state):
+            state = {key.removeprefix("model."): value for key, value in state.items() if key.startswith("model.")}
+        elif any(key.startswith("llm.") for key in state):
+            state = {key.removeprefix("llm."): value for key, value in state.items() if key.startswith("llm.")}
+        parameters = dict(self.llm.named_parameters(remove_duplicate=False))
+        covered = {id(parameters[key]) for key in state.keys() & parameters.keys()}
+        if not covered:
+            raise ValueError("No Flamingo parameters match the legacy checkpoint")
+        if verify_weights:
+            missing = [key for key, param in self.llm.named_parameters() if id(param) not in covered]
+            if missing:
+                raise ValueError(f"Legacy checkpoint lacks {len(missing)} expected parameters, including {missing[:5]}")
+        return self.llm.load_state_dict(state, strict=False)
 
     def eval_prompt(
         self, prompt: FullPrompt, max_new_tokens: int = 1000, normalize: bool = False

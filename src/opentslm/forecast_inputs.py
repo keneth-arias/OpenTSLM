@@ -167,3 +167,25 @@ def verify_weight_snapshot(weights, expected, *, strict=False):
     ):
         raise ValueError("Weight directory does not match the snapshot manifest")
     subprocess.run(["sha256sum", "--strict", "--check", "--status", sums.name], cwd=sums.parent, check=True)
+
+
+def verify_flamingo_binding(path, digest, weights_digest, fit_digest, validation_digest):
+    """Bind the two original role manifests to the promoted Flamingo weights."""
+    from .flamingo_forecast import MODEL_ID, MODEL_REVISION, WEIGHTS_MANIFEST_SHA256
+
+    raw = path.read_bytes()
+    if path.is_symlink() or hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError("Flamingo binding checksum mismatch")
+    spec = json.loads(raw)
+    original = "1d76cc3cfd4c15f9c749372611e5ca6e0b6f910b1fcf0551ce9157e9bfef29c1"
+    expected = {
+        "schema": "airaware-flamingo-binding-v1",
+        "model": MODEL_ID,
+        "revision": MODEL_REVISION,
+        "weights_manifest_sha256": weights_digest,
+        "cohort_weights_manifest_sha256": original,
+        "roles": {"fit": fit_digest, "inner_validation": validation_digest},
+    }
+    if spec != expected or weights_digest != WEIGHTS_MANIFEST_SHA256:
+        raise ValueError("Flamingo base or cohort binding mismatch")
+    return original

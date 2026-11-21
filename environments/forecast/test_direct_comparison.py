@@ -179,14 +179,18 @@ def test_rotation_keeps_selected_checkpoint_for_fallback(tmp_path):
     assert selected_generation(tmp_path, identity, 500).is_dir()
 
 
-def test_previous_unpinned_trainer_can_resume(tmp_path):
+@pytest.mark.parametrize("digest", [
+    "26b418ee1aad96966d5fb55db13ad3c9a1848962e24904f9cbe162d88454889f",
+    "e4a32f79f1533d2583c71f3b74619bd36202b532197f62bcf74f95ef0339e920",
+])
+def test_previous_unpinned_trainer_can_resume(tmp_path, digest):
     import runpy
     from pathlib import Path
 
     script = runpy.run_path(str(Path(__file__).resolve().parents[2] / "scripts/train_qwen_forecast.py"))
     previous = {
         "head": "direct",
-        "trainer": "e4a32f79f1533d2583c71f3b74619bd36202b532197f62bcf74f95ef0339e920",
+        "trainer": digest,
     }
     partial = tmp_path / ".saving"
     partial.mkdir()

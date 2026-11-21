@@ -81,6 +81,16 @@ PYTHONPATH=/opt/forecast/src /opt/conda/bin/python -m opentslm.qwen_text \
 
 For a language receipt, replace `--verify-only` with `--output /result/receipt.json --device cuda:0` in the managed GPU workload. Use the same image, GPU type and precision for duplicate base runs and both sides of the text → forecast → text check. The receipt records prompt, greedy continuation and fixed reference token IDs plus causal negative log likelihood for every reference token. Text mode loads the Qwen generation model in FP32, uses the pinned chat template with thinking disabled, and leaves forecast adapter loading to `opentslm.forecast_inference` in its own process.
 
+For an ordinary text request, pipe one prompt to the same verified base and tokenizer.
+The command writes the greedy answer to standard output. It runs in a fresh process with
+the language head active and the forecast adapter unloaded.
+
+```bash
+printf '%s' '¿Qué significa una media móvil?' | python -m opentslm.qwen_text \
+  --base "$weights" --base-manifest-sha256 "$base_manifest_sha" --tokenizer "$tokenizer" \
+  --prompt-stdin --max-new-tokens 128
+```
+
 ### Check language parity across forecast restoration
 
 Before fitting, run the packaged text fixture twice in separate processes on the verified

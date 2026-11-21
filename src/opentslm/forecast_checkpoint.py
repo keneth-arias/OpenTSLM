@@ -93,9 +93,21 @@ def rotate_direct(root, identity, final):
     keep = direct_dependencies(final, identity)
     if not keep:
         raise ValueError("New direct generation or its selected checkpoint failed verification")
+    primary = keep.copy()
+    previous_saved = False
     for prior in candidates:
-        if prior != final and (dependencies := direct_dependencies(prior, identity)):
+        if prior == final:
+            continue
+        dependencies = direct_dependencies(prior, identity)
+        if not dependencies:
+            continue
+        # A damaged shared best can invalidate two adjacent checkpoints.
+        # Preserve one independent fallback as soon as such a generation exists.
+        independent = primary.isdisjoint(dependencies)
+        if not previous_saved or independent:
             keep.update(dependencies)
+            previous_saved = True
+        if independent:
             break
     for path in candidates:
         if path not in keep:
@@ -108,6 +120,22 @@ def recover(root: Path, identity):
         if valid:
             return int(path.name.removeprefix("step-")), path
     return None
+
+
+def reconcile_direct_resume(root, identity, step):
+    """Fence unusable future generations before replay under the trainer writer lock."""
+    selected = root / f"step-{step:08d}"
+    outcome = root / "direct-result.json"
+    if outcome.exists():
+        recorded = json.loads(outcome.read_bytes())
+        if (recorded["step"] != step or recorded["identity"] != identity or
+                recorded["latest_manifest_sha256"] != sha256(selected / "manifest.json")):
+            raise ValueError("Restore the published terminal checkpoint from its verified export")
+    for future in root.glob("step-????????"):
+        info = read_manifest(future)
+        if info and info["identity"] == identity and info["step"] > step:
+            future.rename(root / f".superseded-{future.name}-{uuid.uuid4().hex}")
+    point_to(root, "latest", selected)
 
 
 def selected_generation(root, identity, best_step):

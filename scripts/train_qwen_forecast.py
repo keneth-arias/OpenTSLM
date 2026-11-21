@@ -18,10 +18,10 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from opentslm.forecast import FORECASTERS, MODEL_REVISION, task_loss
-from opentslm.forecast_checkpoint import finish_direct, point_to, publish, read_manifest, recover, rotate_direct, selected_generation, sha256
+from opentslm.forecast_checkpoint import finish_direct, point_to, publish, read_manifest, reconcile_direct_resume, recover, rotate_direct, selected_generation, sha256
 from opentslm import forecast_direct
 from opentslm.forecast_inputs import direct_cohorts, verify_weight_snapshot
-from opentslm.forecast_inference import JointInputs, add_lora, forecast, forecast_batches, read_task_data, state_options, task_schema, verify_candidate_input
+from opentslm.forecast_inference import JointInputs, add_lora, configure_device, forecast, forecast_batches, read_task_data, state_options, task_schema, verify_candidate_input
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
@@ -194,6 +194,8 @@ def restore(root, model, optimizer, scheduler, args, identity, rank):
             raise ValueError("No complete compatible checkpoint")
         return 0, None, []
     step, path = selected[0]
+    if args.direct_objective:
+        reconcile_direct_resume(root, identity, step)
     state = checkpoint_state(model, optimizer, identity["lora"])
     dcp.load(state, checkpoint_id=path / "dcp")
     set_state_dict(
@@ -509,7 +511,7 @@ def main():
     if world != (1 if args.mode == "single" else 2) or args.batch < world or args.batch % world:
         raise ValueError("Launch one process per GPU with a divisible global batch size")
     device = torch.device("cuda", rank)
-    torch.cuda.set_device(device)
+    configure_device(device)
     dist.init_process_group("nccl", device_id=device)
     try:
         value = torch.tensor(rank + 1, device=device)

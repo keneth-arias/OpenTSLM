@@ -179,3 +179,51 @@ def test_existing_snapshot_links_and_strict_direct_weights(tmp_path):
     verify_weight_snapshot(weights, digest)
     with pytest.raises(ValueError, match="snapshot manifest"):
         verify_weight_snapshot(weights, digest, strict=True)
+
+
+@pytest.mark.parametrize("rotate_before_crash", [True, False])
+def test_damaged_shared_best_replays_past_abandoned_future(tmp_path, rotate_before_crash):
+    from opentslm.forecast_checkpoint import reconcile_direct_resume, recover, rotate_direct
+
+    identity = {"direct_objective": "normalized-mse"}
+
+    def checkpoint(step, best):
+        partial = tmp_path / ".pending"
+        partial.mkdir()
+        metadata = {"evaluations": [{"step": step, "best_step": best}]}
+        (partial / "training.pt.json").write_text(json.dumps(metadata))
+        return publish(tmp_path, partial, step, identity)[0]
+
+    for step, best in [(500, 500), (1000, 1000), (1500, 1000)]:
+        final = checkpoint(step, best)
+        if step != 1500 or rotate_before_crash:
+            rotate_direct(tmp_path, identity, final)
+    (tmp_path / "step-00001000" / "training.pt.json").write_text("damaged")
+    step, _ = recover(tmp_path, identity)
+    assert step == 500
+    reconcile_direct_resume(tmp_path, identity, step)
+    assert (tmp_path / "latest").read_text().strip() == "step-00000500"
+    for step, best in [(1000, 1000), (1500, 1000)]:
+        rotate_direct(tmp_path, identity, checkpoint(step, best))
+    assert recover(tmp_path, identity)[0] == 1500
+    (tmp_path / "direct-result.json").write_text(
+        json.dumps({"step": 1500, "identity": identity, "latest_manifest_sha256": "bad"})
+    )
+    with pytest.raises(ValueError, match="published terminal checkpoint"):
+        reconcile_direct_resume(tmp_path, identity, 1000)
+
+
+def test_allocator_budget_is_opt_in(monkeypatch):
+    from unittest.mock import Mock
+    from opentslm.forecast_inference import configure_device
+
+    monkeypatch.setattr(torch.cuda, "set_device", Mock())
+    fraction = Mock()
+    monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction", fraction)
+    monkeypatch.delenv("FORECAST_GPU_LIMIT_BYTES", raising=False)
+    configure_device(0)
+    fraction.assert_not_called()
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda rank: (3 * 2**30, 4 * 2**30))
+    monkeypatch.setenv("FORECAST_GPU_LIMIT_BYTES", str(2**30))
+    configure_device(0)
+    fraction.assert_called_once_with(0.25, 0)

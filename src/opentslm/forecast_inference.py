@@ -181,6 +181,21 @@ def add_lora(model):
     return names
 
 
+def configure_device(rank):
+    """Apply a deployment's explicit per-process GPU budget before allocating model tensors."""
+    torch.cuda.set_device(rank)
+    raw = os.environ.get("FORECAST_GPU_LIMIT_BYTES")
+    if raw is None:
+        return
+    requested = int(raw)
+    free, total = torch.cuda.mem_get_info(rank)
+    budget = min(requested, free - 256 * 2**20)
+    if budget <= 0 or requested > total:
+        raise ValueError("GPU budget must fit the device and leave memory for the driver")
+    torch.cuda.set_per_process_memory_fraction(budget / total, rank)
+    print(json.dumps({"allocator_limit_bytes": budget}), flush=True)
+
+
 def state_options(lora):
     return StateDictOptions(ignore_frozen_params=lora, strict=not lora)
 
@@ -333,7 +348,7 @@ def main():
     identity = manifest["identity"]
     args.head = checkpoint_head(identity, schema, args.head, args.joint)
     device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
-    torch.cuda.set_device(device)
+    configure_device(device)
     if world > 1:
         dist.init_process_group("nccl", device_id=device)
     try:

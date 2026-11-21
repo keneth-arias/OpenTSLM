@@ -12,7 +12,8 @@ from torch.distributed.checkpoint.state_dict import get_model_state_dict
 from opentslm import flamingo_forecast as ff
 from opentslm.forecast_checkpoint import publish, finish_direct, sha256
 from opentslm.forecast_inference import state_options
-from .test_per_series import model as model  # shared tiny, random Gemma fixture
+
+pytest_plugins = ("test.test_per_series",)
 
 
 def test_selected_forecast_roundtrip(model, tmp_path, monkeypatch):

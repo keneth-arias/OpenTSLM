@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: 2026 Keneth Arias
 # SPDX-License-Identifier: MIT
 """CPU-only verification shared by the trainer and episode preflight."""
 
@@ -152,13 +153,17 @@ def direct_cohorts(fit_manifest, fit_digest, validation_manifest, validation_dig
     return fit, validation
 
 
-def verify_weight_snapshot(weights, expected):
+def verify_weight_snapshot(weights, expected, *, strict=False):
     sums = weights.parent / "SHA256SUMS"
-    if sums.is_symlink() or weights.is_symlink() or sha256(sums) != expected:
+    if (strict and (sums.is_symlink() or weights.is_symlink())) or sha256(sums) != expected:
         raise ValueError("Base snapshot checksum mismatch")
     listed = [line.split(maxsplit=1)[1].removeprefix("*") for line in sums.read_text().splitlines()]
     paths = list(weights.rglob("*"))
     actual = {str(p.relative_to(weights.parent)) for p in paths if p.is_file()}
-    if not actual or sorted(actual) != sorted(listed) or any(p.is_symlink() for p in paths):
+    if (
+        not actual
+        or actual != set(listed)
+        or (strict and (len(listed) != len(actual) or any(p.is_symlink() for p in paths)))
+    ):
         raise ValueError("Weight directory does not match the snapshot manifest")
     subprocess.run(["sha256sum", "--strict", "--check", "--status", sums.name], cwd=sums.parent, check=True)

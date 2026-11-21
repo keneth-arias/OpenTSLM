@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: 2026 Keneth Arias
 # SPDX-License-Identifier: MIT
 from hashlib import sha256
 import json
@@ -128,3 +129,53 @@ def test_resume_repairs_best_and_publishes_one_terminal_result(tmp_path):
     assert finish_direct(tmp_path, identity, 3000, history) == first
     with pytest.raises(ValueError, match="another run"):
         finish_direct(tmp_path, dict(identity, seed=28), 3000, history)
+
+
+def test_rotation_keeps_selected_checkpoint_for_fallback(tmp_path):
+    from opentslm.forecast_checkpoint import recover, rotate_direct
+
+    identity = {"direct_objective": "physical-mae"}
+    for step, best in [(500, 500), (1000, 500), (1500, 1500)]:
+        partial = tmp_path / ".saving"
+        partial.mkdir()
+        metadata = {"evaluations": [{"step": step, "best_step": best}]}
+        (partial / "training.pt.json").write_text(json.dumps(metadata))
+        final, _ = publish(tmp_path, partial, step, identity)
+        rotate_direct(tmp_path, identity, final)
+    (final / "training.pt.json").write_text("damaged")
+    assert recover(tmp_path, identity)[0] == 1000
+    assert selected_generation(tmp_path, identity, 500).is_dir()
+
+
+def test_previous_unpinned_trainer_can_resume(tmp_path):
+    import runpy
+    from pathlib import Path
+
+    script = runpy.run_path(str(Path(__file__).resolve().parents[2] / "scripts/train_qwen_forecast.py"))
+    previous = {
+        "head": "direct",
+        "trainer": "e4a32f79f1533d2583c71f3b74619bd36202b532197f62bcf74f95ef0339e920",
+    }
+    partial = tmp_path / ".saving"
+    partial.mkdir()
+    (partial / "state").write_bytes(b"state")
+    final, _ = publish(tmp_path, partial, 2, previous)
+    current = dict(previous, trainer="new")
+    assert script["resume_generation"](tmp_path, current, False) == ((2, final), previous["trainer"])
+    assert script["resume_generation"](tmp_path, current, True)[0] is None
+
+
+def test_existing_snapshot_links_and_strict_direct_weights(tmp_path):
+    from opentslm.forecast_inputs import verify_weight_snapshot
+
+    weights = tmp_path / "weights"
+    weights.mkdir()
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"fixed")
+    (weights / "model").symlink_to(blob)
+    sums = tmp_path / "SHA256SUMS"
+    sums.write_text(sha256(blob.read_bytes()).hexdigest() + "  weights/model\n")
+    digest = sha256(sums.read_bytes()).hexdigest()
+    verify_weight_snapshot(weights, digest)
+    with pytest.raises(ValueError, match="snapshot manifest"):
+        verify_weight_snapshot(weights, digest, strict=True)

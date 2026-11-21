@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: 2026 Keneth Arias
 # SPDX-License-Identifier: MIT
 """Evaluate the matched direct forecast recipes and checkpoint their selection history."""
 

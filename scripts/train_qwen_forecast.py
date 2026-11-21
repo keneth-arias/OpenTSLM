@@ -18,7 +18,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from opentslm.forecast import FORECASTERS, MODEL_REVISION, task_loss
-from opentslm.forecast_checkpoint import finish_direct, point_to, publish, read_manifest, recover, selected_generation, sha256
+from opentslm.forecast_checkpoint import finish_direct, point_to, publish, read_manifest, recover, rotate_direct, selected_generation, sha256
 from opentslm import forecast_direct
 from opentslm.forecast_inputs import direct_cohorts, verify_weight_snapshot
 from opentslm.forecast_inference import JointInputs, add_lora, forecast, forecast_batches, read_task_data, state_options, task_schema, verify_candidate_input
@@ -32,6 +32,8 @@ from torch.nn.parallel import DistributedDataParallel
 # Script digest of the compatible unversioned direct/persistence trainer at d4a790e.
 LEGACY_TRAINER_SHA256 = "4a17f9f4a9efc393767cfa0d42d89bd29165bae9794bcefa0e4bf1006e6dd9db"
 
+
+PARENT_TRAINER_SHA256 = "e4a32f79f1533d2583c71f3b74619bd36202b532197f62bcf74f95ef0339e920"
 
 PREVIOUS_TRAINER_SHA256 = "88beb175c7c0e4dec8480d9cd1d9fd10b5b2619cad6d377ef1337f73ecc0642e"
 
@@ -74,6 +76,7 @@ def arguments():
         p.error("Supply --logical-run and --direct-objective together")
     if args.direct_objective:
         if (args.mode != "single" or args.head != "direct" or args.input_view or args.matched_point or
+                args.validate_at != "checkpoint" or
                 args.precision != "fp32" or args.batch != 16 or args.seed not in (27, 28) or
                 args.stop_step != args.schedule_steps or args.schedule_steps < forecast_direct.EVAL_INTERVAL):
             p.error("Direct comparison requires a complete single-GPU FP32 batch-16 epoch and a matched seed")
@@ -136,19 +139,22 @@ def save(root, model, optimizer, scheduler, step, identity, rank, best_mae, metr
                 point_to(root, "best", final)
         elif metric is not None and metric <= best_mae:
             point_to(root, "best", final)
-        protected = {final.name}
-        if (root / "best").exists():
-            protected.add((root / "best").read_text().strip())
-        # Rotate only our own published generations, after the new one is visible.
-        candidates = [
-            path
-            for path in sorted(root.glob("step-????????"), reverse=True)
-            if (info := read_manifest(path)) and info["identity"] == identity
-        ]
-        protected.update(p.name for p in candidates[:2])
-        for path in candidates:
-            if path.name not in protected:
-                shutil.rmtree(path)
+        if evaluations is not None:
+            rotate_direct(root, identity, final)
+        else:
+            protected = {final.name}
+            if (root / "best").exists():
+                protected.add((root / "best").read_text().strip())
+            # Rotate only our own published generations, after the new one is visible.
+            candidates = [
+                path
+                for path in sorted(root.glob("step-????????"), reverse=True)
+                if (info := read_manifest(path)) and info["identity"] == identity
+            ]
+            protected.update(p.name for p in candidates[:2])
+            for path in candidates:
+                if path.name not in protected:
+                    shutil.rmtree(path)
         print(
             json.dumps(
                 {
@@ -167,7 +173,7 @@ def resume_generation(root, identity, pinned_source):
     generation = recover(root, identity)
     if generation is not None or pinned_source or "matched_point" in identity or "direct_objective" in identity:
         return generation, identity["trainer"]
-    compatible = [PREVIOUS_TRAINER_SHA256]
+    compatible = [PARENT_TRAINER_SHA256, PREVIOUS_TRAINER_SHA256]
     if "task_schema" not in identity:
         compatible.append(LEGACY_TRAINER_SHA256)
     for revision in compatible:
@@ -316,7 +322,7 @@ def train(args, rank, world, device):
         "weights": sha256(args.weights.parent / "SHA256SUMS"),
     }
     if args.direct_objective:
-        verify_weight_snapshot(args.weights, identity["weights"])
+        verify_weight_snapshot(args.weights, identity["weights"], strict=True)
         identity.update(direct_objective=args.direct_objective, logical_run=args.logical_run,
                         input_manifest_sha256=args.input_manifest_sha256, validation_manifest_sha256=args.validation_manifest_sha256,
                         evaluation_interval=forecast_direct.EVAL_INTERVAL, patience_checks=forecast_direct.PATIENCE,

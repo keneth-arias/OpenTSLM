@@ -5,6 +5,7 @@
 import hashlib
 import json
 import os
+import shutil
 import uuid
 from pathlib import Path
 
@@ -66,11 +67,46 @@ def read_manifest(path):
     return None
 
 
+def intact(path, identity):
+    manifest = read_manifest(path)
+    return bool(manifest and manifest["identity"] == identity and manifest["files"] == files(path))
+
+
+def direct_dependencies(path, identity):
+    """Return both directories needed to resume this intact direct generation."""
+    if not intact(path, identity):
+        return set()
+    metadata = json.loads((path / "training.pt.json").read_bytes())
+    best_step = metadata["evaluations"][-1]["best_step"]
+    needed = {path}
+    if best_step is not None:
+        best = path.parent / f"step-{best_step:08d}"
+        if best != path and not intact(best, identity):
+            return set()
+        needed.add(best)
+    return needed
+
+
+def rotate_direct(root, identity, final):
+    candidates = [p for p in sorted(root.glob("step-????????"), reverse=True)
+                  if (info := read_manifest(p)) and info["identity"] == identity]
+    keep = direct_dependencies(final, identity)
+    if not keep:
+        raise ValueError("New direct generation or its selected checkpoint failed verification")
+    for prior in candidates:
+        if prior != final and (dependencies := direct_dependencies(prior, identity)):
+            keep.update(dependencies)
+            break
+    for path in candidates:
+        if path not in keep:
+            shutil.rmtree(path)
+
+
 def recover(root: Path, identity):
     for path in sorted(root.glob("step-????????"), reverse=True):
-        manifest = read_manifest(path)
-        if manifest and manifest["identity"] == identity and manifest["files"] == files(path):
-            return manifest["step"], path
+        valid = direct_dependencies(path, identity) if "direct_objective" in identity else intact(path, identity)
+        if valid:
+            return int(path.name.removeprefix("step-")), path
     return None
 
 

@@ -109,7 +109,11 @@ FORECASTERS = {
 }
 
 
-def task_loss(head, predicted, target, center, scale):
+def task_loss(head, predicted, target, center, scale, *, direct_objective="normalized-mse"):
+    if direct_objective == "physical-mae" and head == "direct":
+        return nn.functional.l1_loss(predicted * scale + center, target)
+    if direct_objective != "normalized-mse":
+        raise ValueError("Unsupported objective for this forecast head")
     if head == "episode":
         return nn.functional.binary_cross_entropy_with_logits(predicted, target)
     normalized = (target - center) / scale

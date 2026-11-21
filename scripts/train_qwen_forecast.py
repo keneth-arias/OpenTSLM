@@ -18,8 +18,10 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from opentslm.forecast import FORECASTERS, MODEL_REVISION, task_loss
-from opentslm.forecast_checkpoint import point_to, publish, read_manifest, recover, sha256
-from opentslm.forecast_inference import JointInputs, add_lora, forecast, forecast_batches, read_task_data, state_options, task_schema, verify_candidate_input
+from opentslm.forecast_checkpoint import finish_direct, point_to, publish, read_manifest, reconcile_direct_resume, recover, rotate_direct, selected_generation, sha256
+from opentslm import forecast_direct
+from opentslm.forecast_inputs import direct_cohorts, verify_weight_snapshot
+from opentslm.forecast_inference import JointInputs, add_lora, configure_device, forecast, forecast_batches, read_task_data, state_options, task_schema, verify_candidate_input
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
@@ -30,6 +32,8 @@ from torch.nn.parallel import DistributedDataParallel
 # Script digest of the compatible unversioned direct/persistence trainer at d4a790e.
 LEGACY_TRAINER_SHA256 = "4a17f9f4a9efc393767cfa0d42d89bd29165bae9794bcefa0e4bf1006e6dd9db"
 
+
+PARENT_TRAINER_SHA256 = "e4a32f79f1533d2583c71f3b74619bd36202b532197f62bcf74f95ef0339e920"
 
 PREVIOUS_TRAINER_SHA256 = "88beb175c7c0e4dec8480d9cd1d9fd10b5b2619cad6d377ef1337f73ecc0642e"
 
@@ -56,6 +60,8 @@ def arguments():
         help="Validate at each save or only at the final scheduled update",
     )
     p.add_argument("--matched-point",action="store_true",help="Fit the one-GPU direct control on the same full epoch as the candidate heads")
+    p.add_argument("--direct-objective", choices=forecast_direct.OBJECTIVES)
+    p.add_argument("--logical-run", help="Stable identifier of this matched fit across attempts")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--lora", action="store_true")
     p.add_argument("--input-manifest", type=Path)
@@ -66,6 +72,18 @@ def arguments():
     p.add_argument("--scaler", type=Path)
     p.add_argument("--input-view", choices=("first", "both"))
     args = p.parse_args()
+    if bool(args.logical_run) != bool(args.direct_objective):
+        p.error("Supply --logical-run and --direct-objective together")
+    if args.direct_objective:
+        if (args.mode != "single" or args.head != "direct" or args.input_view or args.matched_point or
+                args.validate_at != "checkpoint" or
+                args.precision != "fp32" or args.batch != 16 or args.seed not in (27, 28) or
+                args.stop_step != args.schedule_steps or args.schedule_steps < forecast_direct.EVAL_INTERVAL):
+            p.error("Direct comparison requires a complete single-GPU FP32 batch-16 epoch and a matched seed")
+        if not all((args.input_manifest, args.input_manifest_sha256, args.validation,
+                    args.validation_manifest, args.validation_manifest_sha256)):
+            p.error("The direct comparison requires both pinned cohort manifests")
+        args.lora = True
     if args.matched_point and args.head!="direct":
         p.error("--matched-point requires the direct head")
     if args.matched_point or args.head in ("quantile", "episode"):
@@ -95,7 +113,7 @@ def checkpoint_state(model, optimizer, lora):
     return {"model": params, "optimizer": optim}
 
 
-def save(root, model, optimizer, scheduler, step, identity, rank, best_mae, metric):
+def save(root, model, optimizer, scheduler, step, identity, rank, best_mae, metric, evaluations=None):
     started = time.monotonic()
     staging = [tempfile.mkdtemp(prefix=".saving-", dir=root) if rank == 0 else None]
     dist.broadcast_object_list(staging)
@@ -107,25 +125,36 @@ def save(root, model, optimizer, scheduler, step, identity, rank, best_mae, metr
     )
     dist.barrier()
     if rank == 0:
-        (staging / "training.pt.json").write_text(
-            json.dumps({"scheduler": scheduler.state_dict(), **({"best_metric": best_mae, "metric": "brier_uncalibrated" if identity["head"] == "episode" else "mae"} if "task_schema" in identity else {"best_mae": best_mae})})
-        )
+        metadata = {"scheduler": scheduler.state_dict()}
+        if evaluations is not None:
+            metadata["evaluations"] = evaluations
+        elif "task_schema" in identity:
+            metadata.update(best_metric=best_mae, metric="brier_uncalibrated" if identity["head"] == "episode" else "mae")
+        else:
+            metadata["best_mae"] = best_mae
+        (staging / "training.pt.json").write_text(json.dumps(metadata, allow_nan=False))
         final, manifest = publish(root, staging, step, identity)
-        if metric is not None and metric <= best_mae:
+        if evaluations is not None:
+            if evaluations[-1]["best_step"] == step:
+                point_to(root, "best", final)
+        elif metric is not None and metric <= best_mae:
             point_to(root, "best", final)
-        protected = {final.name}
-        if (root / "best").exists():
-            protected.add((root / "best").read_text().strip())
-        # Rotate only our own published generations, after the new one is visible.
-        candidates = [
-            path
-            for path in sorted(root.glob("step-????????"), reverse=True)
-            if (info := read_manifest(path)) and info["identity"] == identity
-        ]
-        protected.update(p.name for p in candidates[:2])
-        for path in candidates:
-            if path.name not in protected:
-                shutil.rmtree(path)
+        if evaluations is not None:
+            rotate_direct(root, identity, final)
+        else:
+            protected = {final.name}
+            if (root / "best").exists():
+                protected.add((root / "best").read_text().strip())
+            # Rotate only our own published generations, after the new one is visible.
+            candidates = [
+                path
+                for path in sorted(root.glob("step-????????"), reverse=True)
+                if (info := read_manifest(path)) and info["identity"] == identity
+            ]
+            protected.update(p.name for p in candidates[:2])
+            for path in candidates:
+                if path.name not in protected:
+                    shutil.rmtree(path)
         print(
             json.dumps(
                 {
@@ -142,9 +171,9 @@ def save(root, model, optimizer, scheduler, step, identity, rank, best_mae, metr
 
 def resume_generation(root, identity, pinned_source):
     generation = recover(root, identity)
-    if generation is not None or pinned_source or "matched_point" in identity:
+    if generation is not None or pinned_source or "matched_point" in identity or "direct_objective" in identity:
         return generation, identity["trainer"]
-    compatible = [PREVIOUS_TRAINER_SHA256]
+    compatible = [PARENT_TRAINER_SHA256, PREVIOUS_TRAINER_SHA256]
     if "task_schema" not in identity:
         compatible.append(LEGACY_TRAINER_SHA256)
     for revision in compatible:
@@ -163,8 +192,10 @@ def restore(root, model, optimizer, scheduler, args, identity, rank):
     if selected[0] is None:
         if args.resume:
             raise ValueError("No complete compatible checkpoint")
-        return 0, None
+        return 0, None, []
     step, path = selected[0]
+    if args.direct_objective:
+        reconcile_direct_resume(root, identity, step)
     state = checkpoint_state(model, optimizer, identity["lora"])
     dcp.load(state, checkpoint_id=path / "dcp")
     set_state_dict(
@@ -181,7 +212,12 @@ def restore(root, model, optimizer, scheduler, args, identity, rank):
     torch.cuda.set_rng_state(rng["cuda"])
     if rank == 0:
         print(json.dumps({"restored_step": step, "checkpoint": path.name}), flush=True)
-    return step, metadata["best_metric"] if "best_metric" in metadata else metadata["best_mae"]
+    if args.direct_objective:
+        evaluations = metadata["evaluations"]
+        if evaluations[-1]["best_step"] is not None:
+            selected_generation(root, identity, evaluations[-1]["best_step"])
+        return step, evaluations[-1]["best_mae"], evaluations
+    return step, metadata["best_metric"] if "best_metric" in metadata else metadata["best_mae"], []
 
 
 @torch.no_grad()
@@ -239,10 +275,18 @@ def epoch_batches(rows, batch, *, include_partial):
 
 
 def epoch_order(ids, args, epoch):
-    include_partial = bool(args.joint or args.task_schema or args.matched_point)
+    include_partial = bool(args.joint or args.task_schema or args.matched_point or args.direct_objective)
     batches = epoch_batches(len(ids), args.batch, include_partial=include_partial)
     order = torch.randperm(len(ids), generator=torch.Generator().manual_seed(args.seed + epoch))
     return order[:batches * args.batch]
+
+
+def stop_marked(path):
+    # A vanished armed channel should stop the worker at its next safe point.
+    try:
+        return Path(path).stat().st_size > 0
+    except FileNotFoundError:
+        return True
 
 
 def train(args, rank, world, device):
@@ -250,14 +294,27 @@ def train(args, rank, world, device):
         verify_candidate_input(args.data, args.input_manifest, args.input_manifest_sha256, "fit", args.head, args.thresholds_sha256)
         if args.validation:
             verify_candidate_input(args.validation, args.validation_manifest, args.validation_manifest_sha256, "inner_validation", args.head, args.thresholds_sha256)
-    ids, history, targets, thresholds = read_task_data(args.data, args.joint, args.head, args.thresholds_sha256)
-    window_order = epoch_order(ids,args,0)
+    cohorts = evaluation = None
+    if args.direct_objective:
+        if (args.data != args.input_manifest.parent / "data.npz" or
+                args.validation != args.validation_manifest.parent / "data.npz"):
+            raise ValueError("Cohort data must come from its pinned role directory")
+        cohorts = direct_cohorts(args.input_manifest, args.input_manifest_sha256, args.validation_manifest,
+                                 args.validation_manifest_sha256, sha256(args.weights.parent / "SHA256SUMS"))
+        fit = cohorts[0]
+        ids = fit["window_id"]
+        history = torch.from_numpy(fit["history"]).float().unsqueeze(-1)
+        targets = torch.from_numpy(fit["targets"]).float().unsqueeze(-1)
+        thresholds = None
+    else:
+        ids, history, targets, thresholds = read_task_data(args.data, args.joint, args.head, args.thresholds_sha256)
+        evaluation = read_task_data(args.validation, args.joint, args.head, args.thresholds_sha256) if args.validation else None
+        if evaluation is not None and (not len(evaluation[0]) or np.intersect1d(ids, evaluation[0]).size):
+            raise ValueError("Validation must be nonempty and disjoint from training")
+    window_order = epoch_order(ids, args, 0)
     batches = math.ceil(len(window_order) / args.batch)
-    if batches < 1:
-        raise ValueError("One complete training batch is required")
-    evaluation = read_task_data(args.validation, args.joint, args.head, args.thresholds_sha256) if args.validation else None
-    if evaluation is not None and (not len(evaluation[0]) or np.intersect1d(ids, evaluation[0]).size):
-        raise ValueError("Validation must be nonempty and disjoint from training")
+    if batches < 1 or (cohorts and args.schedule_steps != batches):
+        raise ValueError("Schedule does not match the available training batches")
     identity = {
         "model": MODEL_REVISION,
         "batch": args.batch,
@@ -274,6 +331,15 @@ def train(args, rank, world, device):
         "trainer": os.environ.get("FORECAST_SOURCE_REVISION", sha256(Path(__file__))),
         "weights": sha256(args.weights.parent / "SHA256SUMS"),
     }
+    if args.direct_objective:
+        verify_weight_snapshot(args.weights, identity["weights"], strict=True)
+        identity.update(direct_objective=args.direct_objective, logical_run=args.logical_run,
+                        input_manifest_sha256=args.input_manifest_sha256, validation_manifest_sha256=args.validation_manifest_sha256,
+                        evaluation_interval=forecast_direct.EVAL_INTERVAL, patience_checks=forecast_direct.PATIENCE,
+                        min_improvement_ug_m3=str(forecast_direct.MIN_IMPROVEMENT), optimizer={"name": "AdamW", "lr": 1e-4, "weight_decay": 0,
+                            "gradient_clip": 1.0, "scheduler": "cosine", "lora_rank": 4, "lora_alpha": 8})
+        recipe = {k: v for k, v in identity.items() if k != "logical_run"}
+        identity["recipe_sha256"] = hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()
     if args.task_schema:
         identity.update(task_schema=args.task_schema, input_manifest_sha256=args.input_manifest_sha256,
                         validation_manifest_sha256=args.validation_manifest_sha256)
@@ -287,12 +353,28 @@ def train(args, rank, world, device):
     torch.manual_seed(args.seed)
     forecaster = FORECASTERS[args.head]
     dimensions = {"channels": 2, "targets": 2} if args.joint else {}
+    stop_file = os.environ.get("EPISODE_STOP_FILE")
+
+    def stop_requested():
+        if not stop_file:
+            return False
+        flag = torch.tensor(bool(rank == 0 and stop_marked(stop_file)), device=device)
+        dist.broadcast(flag, src=0)
+        return flag.item()
+
+    if stop_requested():
+        if rank == 0:
+            print(json.dumps({"stopped_before_update": True}), flush=True)
+        return
+    load_started = time.monotonic()
     model = forecaster.from_pretrained(checkpoint_path=str(args.weights), local_files_only=True, **dimensions)
+    loaded_at = time.monotonic()
     # The embedding table is unused with numerical soft prompts.
     model.decoder.get_input_embeddings().requires_grad_(False)
     adapters = add_lora(model) if args.lora else []
     if args.joint:
         identity["joint"] = args.joint.identity()
+    if args.joint or args.direct_objective:
         initial = hashlib.sha256()
         for name, parameter in model.named_parameters():
             if parameter.requires_grad:
@@ -302,6 +384,9 @@ def train(args, rank, world, device):
     if adapters and rank == 0:
         print(json.dumps({"adapter_modules": adapters}), flush=True)
     model = model.to(device)
+    if rank == 0:
+        print(json.dumps({"model_load_seconds": loaded_at - load_started,
+                          "model_placement_seconds": time.monotonic() - loaded_at}), flush=True)
     if args.mode == "fsdp":
         mesh = init_device_mesh("cuda", (world,))
         policy = MixedPrecisionPolicy(
@@ -318,11 +403,27 @@ def train(args, rank, world, device):
         [p for p in model.parameters() if p.requires_grad], lr=1e-4, weight_decay=0, foreach=False
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.schedule_steps)
-    step, best = restore(args.run_dir, model, optimizer, scheduler, args, identity, rank)
+    step, best, evaluations = restore(args.run_dir, model, optimizer, scheduler, args, identity, rank)
+    def evaluate_pair(update):
+        sample, inner = (forecast_direct.evaluate_direct(model, rows, args, device) for rows in cohorts)
+        selected = forecast_direct.selection(evaluations, update, inner["mae"], args.schedule_steps)
+        evaluations.append({**selected, "fit_sample": sample, "inner_validation": inner})
+        print(json.dumps({"step": update, "direct_evaluation": evaluations[-1]}, allow_nan=False), flush=True)
+
+    if cohorts and evaluations and evaluations[-1]["outcome"] != "running":
+        finish_direct(args.run_dir, identity, step, evaluations)
+        return
     if not step < args.stop_step:
         raise ValueError("Stopping step must advance the restored run")
     current_epoch = 0
     saved_at = time.monotonic()
+    if stop_requested():
+        if rank == 0:
+            print(json.dumps({"stopped_before_update": True}), flush=True)
+        return
+    if cohorts and not evaluations:
+        evaluate_pair(0)
+    first_cursor = step
     for cursor in range(step, args.stop_step):
         epoch, position = divmod(cursor, batches)
         if current_epoch != epoch:
@@ -336,7 +437,7 @@ def train(args, rank, world, device):
         optimizer.zero_grad(set_to_none=True)
         context = thresholds[subset].to(device) if thresholds is not None else None
         prediction, center, scale = forecast(model, x, args, context)
-        loss = task_loss(args.head, prediction, y, center, scale)
+        loss = task_loss(args.head, prediction, y, center, scale, direct_objective=args.direct_objective or "normalized-mse")
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True, foreach=False)
         optimizer.step()
@@ -355,10 +456,15 @@ def train(args, rank, world, device):
         per_rank = [torch.empty_like(peak) for _ in range(world)]
         dist.all_gather(per_rank, peak)
         step = cursor + 1
-        save_now = torch.tensor(
-            int(step == args.stop_step or time.monotonic() - saved_at >= args.save_seconds) if rank == 0 else 0,
-            device=device,
-        )
+        action = 0
+        if rank == 0:
+            if stop_file and step < args.stop_step and stop_marked(stop_file):
+                action = 2  # Publish this step and leave on all ranks.
+            elif step == args.stop_step or (cohorts and step == evaluations[-1]["next_eval_step"]) or time.monotonic() - saved_at >= args.save_seconds:
+                action = 1
+            if cursor == first_cursor:
+                print(json.dumps({"first_update_since_model_load_seconds": time.monotonic() - load_started}), flush=True)
+        save_now = torch.tensor(action, device=device)
         dist.broadcast(save_now, src=0)
         if rank == 0:
             print(
@@ -367,7 +473,9 @@ def train(args, rank, world, device):
                         "step": step,
                         "loss": loss_value.item(),
                         "learning_rate_next": scheduler.get_last_lr()[0],
-                        "window_ids": ids[indices.numpy()].tolist(),
+                        **({"batch_window_ids_sha256": hashlib.sha256(
+                            ("\n".join(ids[indices.numpy()]) + "\n").encode()).hexdigest()}
+                           if args.direct_objective else {"window_ids": ids[indices.numpy()].tolist()}),
                         "windows_per_second": len(indices) / elapsed.item(),
                         "peak_bytes_per_rank": [v.tolist() for v in per_rank],
                         "probe_global_elements": probe.numel(),
@@ -383,14 +491,24 @@ def train(args, rank, world, device):
             dist.all_reduce(disk_ok, op=dist.ReduceOp.MIN)
             if not disk_ok.item():
                 raise OSError("Insufficient free space for a new checkpoint generation")
-            evaluate_now = evaluation is not None and (args.validate_at == "checkpoint" or step == args.schedule_steps)
+            evaluate_now = save_now.item() != 2 and evaluation is not None and (args.validate_at == "checkpoint" or step == args.schedule_steps)
             metrics = validation(model, evaluation, args, rank, world, device) if evaluate_now else {}
             if rank == 0 and metrics:
                 print(json.dumps({"step": step, **metrics}), flush=True)
             metric = metrics.get("brier_uncalibrated" if args.head == "episode" else "mae")
             if metric is not None:
                 best = metric if best is None else min(best, metric)
-            save(args.run_dir, model, optimizer, scheduler, step, identity, rank, best, metric)
+            if cohorts and step == evaluations[-1]["next_eval_step"]:
+                evaluate_pair(step)
+            save(args.run_dir, model, optimizer, scheduler, step, identity, rank, best, metric,
+                 evaluations if cohorts else None)
+            if cohorts and evaluations[-1]["outcome"] != "running":
+                finish_direct(args.run_dir, identity, step, evaluations)
+                return
+            if save_now.item() == 2 or (step < args.stop_step and stop_requested()):
+                if rank == 0:
+                    print(json.dumps({"interrupted_at_step": step}), flush=True)
+                return
             saved_at = time.monotonic()
 
 
@@ -401,7 +519,7 @@ def main():
     if world != (1 if args.mode == "single" else 2) or args.batch < world or args.batch % world:
         raise ValueError("Launch one process per GPU with a divisible global batch size")
     device = torch.device("cuda", rank)
-    torch.cuda.set_device(device)
+    configure_device(device)
     dist.init_process_group("nccl", device_id=device)
     try:
         value = torch.tensor(rank + 1, device=device)

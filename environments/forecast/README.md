@@ -80,3 +80,32 @@ PYTHONPATH=/opt/forecast/src /opt/conda/bin/python -m opentslm.qwen_text \
 ```
 
 For a language receipt, replace `--verify-only` with `--output /result/receipt.json --device cuda:0` in the managed GPU workload. Use the same image, GPU type and precision for duplicate base runs and both sides of the text → forecast → text check. The receipt records prompt, greedy continuation and fixed reference token IDs plus causal negative log likelihood for every reference token. Text mode loads the Qwen generation model in FP32, uses the pinned chat template with thinking disabled, and leaves forecast adapter loading to `opentslm.forecast_inference` in its own process.
+
+### Check language parity across forecast restoration
+
+Before fitting, run the packaged text fixture twice in separate processes on the verified
+managed GPU. Save both receipts and their SHA-256 values in the run record before selecting
+a checkpoint. Use the same immutable trainer image, GPU model, precision, tokenizer and
+template for the post-restore text run. With the selected checkpoint mounted read-only,
+run `opentslm.forecast_inference --head direct --require-history-only` in two fresh workers
+or processes with the frozen single-window history. Record each worker or process and the
+input and output digests. Then run the text fixture again in a fresh process. Keep receipts
+and predictions in private run storage.
+
+Run this comparison for each selected candidate. Supply the approved **pre-fit** receipt
+hashes and the independently recorded hash of the selected checkpoint's `manifest.json`.
+
+```bash
+python -m opentslm.qwen_text_parity \
+  --fixture "$fixture" --history "$history" \
+  --base "$base_receipt" --repeat "$repeat_receipt" --after "$restored_text" \
+  --approved-baselines "$approved_base_sha" "$approved_repeat_sha" \
+  --forecasts "$first_predictions" "$second_predictions" \
+  --checkpoint-sha256 "$selected_manifest_sha"
+```
+
+The command checks the frozen inputs, runtime identity, exact token IDs, and maximum absolute
+per-token loss difference measured between the two base runs. It also checks the window,
+selected checkpoint, all six horizons and identical finite FP32 predictions. On success it
+prints a JSON summary with artifact hashes. Keep the managed job IDs and chronology with
+that summary to establish where and when the separate runs took place.

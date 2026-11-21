@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from opentslm import qwen_text, qwen_text_parity as parity
+from opentslm.forecast_inference import write_predictions
 
 
 @pytest.fixture
@@ -34,8 +35,8 @@ def inputs(tmp_path, monkeypatch):
     checkpoint = "a" * 64
     outputs = [tmp_path / name for name in ("first.npz", "second.npz")]
     for path in outputs:
-        np.savez(path, checkpoint_sha256=checkpoint, window_id=["fixture"],
-                 forecast_hour=np.arange(1, 7), predicted=np.ones((1, 6), dtype="float32"))
+        shards = [(np.array([0]), np.ones((1, 6, 1), dtype="float32"))]
+        write_predictions(path, np.array(["fixture"]), shards, checkpoint, input_sha256=parity.HISTORY_SHA256)
     return Namespace(fixture=fixture, history=history, base=base, repeat=repeat, after=after,
                      approved_baselines=[parity.digest(p.read_bytes()) for p in (base, repeat)],
                      checkpoint_sha256=checkpoint, forecasts=outputs)
@@ -60,7 +61,7 @@ def test_language_drift(inputs, field, value):
 
 
 @pytest.mark.parametrize(("field", "value"), [
-    ("checkpoint_sha256", "b" * 64), ("window_id", ["elsewhere"]),
+    ("checkpoint_sha256", "b" * 64), ("history_sha256", "b" * 64), ("window_id", ["elsewhere"]),
     ("forecast_hour", np.arange(6)), ("predicted", np.zeros((1, 6), dtype="float32")),
     ("predicted", np.full((1, 6), np.nan, dtype="float32")),
 ])
@@ -92,4 +93,10 @@ def test_two_paths_to_one_output(inputs):
     inputs.forecasts[1].unlink()
     inputs.forecasts[1].hardlink_to(inputs.forecasts[0])
     with pytest.raises(ValueError, match="separate runs"):
+        parity.qualify(inputs)
+
+
+def test_other_history_with_same_window_id(inputs):
+    np.savez(inputs.history, window_id=["fixture"], history=np.ones((1, 24), dtype="float32"))
+    with pytest.raises(ValueError, match="history"):
         parity.qualify(inputs)

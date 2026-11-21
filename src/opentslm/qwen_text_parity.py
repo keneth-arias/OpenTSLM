@@ -21,6 +21,15 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def frozen_history(path):
+    # This single-window NPZ is 682 bytes. Bound the read before accepting its digest.
+    with path.open("rb") as stream:
+        data = stream.read(683)
+    if digest(data) != HISTORY_SHA256:
+        raise ValueError("Forecast history differs from the frozen input")
+    return data
+
+
 def read_cases(receipt, names):
     cases = receipt["cases"]
     if [row["case"] for row in cases] != names:
@@ -80,8 +89,10 @@ def compare_forecasts(outputs, window, checkpoint):
     first = None
     for raw in outputs:
         with np.load(io.BytesIO(raw), allow_pickle=False) as saved:
-            if sorted(saved.files) != ["checkpoint_sha256", "forecast_hour", "predicted", "window_id"]:
+            if sorted(saved.files) != ["checkpoint_sha256", "forecast_hour", "history_sha256", "predicted", "window_id"]:
                 raise ValueError("Expected a single direct forecast")
+            if saved["history_sha256"].shape != () or saved["history_sha256"].item() != HISTORY_SHA256:
+                raise ValueError("Prediction was produced from a different history")
             if saved["checkpoint_sha256"].shape != () or saved["checkpoint_sha256"].item() != checkpoint:
                 raise ValueError("Prediction checkpoint differs from the selected manifest")
             if not np.array_equal(saved["window_id"], window) or not np.array_equal(saved["forecast_hour"], np.arange(1, 7)):
@@ -102,9 +113,9 @@ def qualify(args):
     if [digest(base), digest(repeat)] != args.approved_baselines:
         raise ValueError("Baseline receipt differs from pre-fit approval")
     fixture = args.fixture.read_bytes()
-    history = args.history.read_bytes()
-    if digest(fixture) != qwen_text.FIXTURE_SHA256 or digest(history) != HISTORY_SHA256:
-        raise ValueError("Language fixture or forecast history differs from the frozen inputs")
+    history = frozen_history(args.history)
+    if digest(fixture) != qwen_text.FIXTURE_SHA256:
+        raise ValueError("Language fixture differs from the frozen input")
     names = [row[0] for row in json.loads(fixture)["cases"]]
     result = compare_text([json.loads(raw) for raw in (base, repeat, after)], names)
     with np.load(io.BytesIO(history), allow_pickle=False) as inputs:

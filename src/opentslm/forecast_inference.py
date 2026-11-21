@@ -4,6 +4,7 @@
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
@@ -276,6 +277,8 @@ def write_predictions(path, ids, shards, checkpoint_sha256=None, joint=None, *, 
     if not np.array_equal(indices[order], np.arange(len(ids))) or values.shape != shape or not np.isfinite(values).all():
         raise ValueError("Expected one finite task output per input window")
     payload = {"window_id": ids}
+    if head == "direct" and input_sha256 is not None:
+        payload["history_sha256"] = input_sha256
     if checkpoint_sha256:
         payload["checkpoint_sha256"] = checkpoint_sha256
     if head in ("episode", "quantile"):
@@ -321,7 +324,11 @@ def main():
     parser.add_argument(
         "--require-history-only", action="store_true", help="Reject fields outside the history input schema"
     )
+    parser.add_argument("--parity-history", action="store_true",
+                        help="Use the frozen univariate language-parity history and bind its digest to the output")
     args = parser.parse_args()
+    if args.parity_history and (args.head != "direct" or args.input_view or args.scaler):
+        parser.error("--parity-history requires a univariate --head direct forecast")
     if bool(args.input_view) != bool(args.scaler):
         parser.error("Supply both input view and fitted scaler")
     args.joint = JointInputs.load(args.scaler, args.input_view) if args.scaler else None
@@ -338,8 +345,15 @@ def main():
         parser.error("Candidate heads use univariate inputs; only episodes use thresholds")
     if schema:
         verify_candidate_input(args.data, args.input_manifest, args.input_manifest_sha256, "infer", args.head, args.thresholds_sha256)
-    with np.load(args.data, allow_pickle=False) as data:
-        ids, history = read_history(data, args.joint, require_history_only=args.require_history_only or bool(schema),
+    source = args.data
+    parity_hash = None
+    if args.parity_history:
+        from opentslm.qwen_text_parity import HISTORY_SHA256, frozen_history
+
+        source = io.BytesIO(frozen_history(source))
+        parity_hash = HISTORY_SHA256
+    with np.load(source, allow_pickle=False) as data:
+        ids, history = read_history(data, args.joint, require_history_only=args.require_history_only or args.parity_history or bool(schema),
                                     episode=args.head == "episode")
         thresholds = episode_thresholds(data, ids, args.thresholds_sha256) if args.head == "episode" else None
     manifest = read_manifest(args.checkpoint)
@@ -378,7 +392,7 @@ def main():
         if rank == 0:
             digest = sha256(args.checkpoint / "manifest.json")
             write_predictions(args.output, ids, shards, digest, args.joint, head=args.head,
-                              input_sha256=sha256(args.data) if schema else None,
+                              input_sha256=sha256(args.data) if schema else parity_hash,
                               thresholds_sha256=args.thresholds_sha256, input_manifest_sha256=args.input_manifest_sha256)
             print(json.dumps({"windows": len(ids), "checkpoint_sha256": digest, "output_sha256": sha256(args.output)}))
     finally:

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 import json
+from io import StringIO
 from subprocess import CalledProcessError
 from types import SimpleNamespace
 
@@ -80,6 +81,11 @@ class ToyTokenizer:
         assert add_special_tokens is False
         return {"rendered": [0, 1], "Buenos días": [2, 3]}[text]
 
+    def decode(self, ids, *, skip_special_tokens):
+        assert ids == [4, 5]
+        assert skip_special_tokens is True
+        return "Buenas"
+
 
 class ToyModel:
     def generate(self, *, input_ids, attention_mask, **kwargs):
@@ -135,3 +141,32 @@ def test_packaged_command_writes_private_receipt_once(tmp_path, monkeypatch):
     with pytest.raises(FileExistsError):
         qwen_text.main(argv)
     assert calls == ["cpu"]
+
+
+def test_stdin_generates_with_pinned_inputs_without_a_fixture(tmp_path, monkeypatch, capsys):
+    weights, tokenizer, fixture = stage_inputs(tmp_path, monkeypatch)
+    fixture.unlink()
+
+    def load_model(weights_path, tokenizer_path, device):
+        assert (weights_path, tokenizer_path, device) == (weights, tokenizer, "cpu")
+        return ToyModel(), ToyTokenizer()
+
+    monkeypatch.setattr(qwen_text, "load_model", load_model)
+    monkeypatch.setattr("sys.stdin", StringIO("Hola"))
+    qwen_text.main([
+        "--base", str(weights), "--base-manifest-sha256", qwen_text.BASE_MANIFEST_SHA256,
+        "--tokenizer", str(tokenizer), "--device", "cpu", "--prompt-stdin", "--max-new-tokens", "2",
+    ])
+    assert capsys.readouterr().out == "Buenas\n"
+
+
+def test_stdin_rejects_changed_tokenizer_before_loading_model(tmp_path, monkeypatch):
+    weights, tokenizer, _ = stage_inputs(tmp_path, monkeypatch)
+    (tokenizer / "chat_template.jinja").write_text("changed")
+    monkeypatch.setattr("sys.stdin", StringIO("Hello"))
+    monkeypatch.setattr(qwen_text, "load_model", lambda *_: pytest.fail("loaded model"))
+    with pytest.raises(ValueError, match="Tokenizer checksum mismatch"):
+        qwen_text.main([
+            "--base", str(weights), "--base-manifest-sha256", qwen_text.BASE_MANIFEST_SHA256,
+            "--tokenizer", str(tokenizer), "--device", "cpu", "--prompt-stdin",
+        ])

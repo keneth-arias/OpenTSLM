@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 from importlib.metadata import version
 from pathlib import Path
 
@@ -26,7 +27,7 @@ TOKENIZER_MANIFEST_SHA256 = hashlib.sha256("".join(
 ).encode("ascii")).hexdigest()
 
 
-def verify_inputs(weights, expected_base_digest, tokenizer, fixture):
+def verify_model_inputs(weights, expected_base_digest, tokenizer):
     from .forecast_inputs import verify_weight_snapshot
 
     if expected_base_digest != BASE_MANIFEST_SHA256:
@@ -38,16 +39,17 @@ def verify_inputs(weights, expected_base_digest, tokenizer, fixture):
         path = tokenizer / name
         if path.is_symlink() or not path.is_file() or sha256(path) != digest:
             raise ValueError(f"Tokenizer checksum mismatch for {name}")
+
+
+def verify_inputs(weights, expected_base_digest, tokenizer, fixture):
+    verify_model_inputs(weights, expected_base_digest, tokenizer)
     fixture_bytes = fixture.read_bytes()
     if hashlib.sha256(fixture_bytes).hexdigest() != FIXTURE_SHA256:
         raise ValueError("Language fixture checksum mismatch")
     return json.loads(fixture_bytes)
 
 
-def run_case(model, tokenizer, name, prompt, reference, max_new_tokens, device):
-    """Decode one greedy continuation and score the fixed reference token by token."""
-    import torch
-
+def encode_prompt(tokenizer, prompt):
     rendered = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
         tokenize=False,
@@ -55,9 +57,14 @@ def run_case(model, tokenizer, name, prompt, reference, max_new_tokens, device):
         enable_thinking=False,
     )
     ids = tokenizer.encode(rendered, add_special_tokens=False)
-    answer = tokenizer.encode(reference, add_special_tokens=False)
-    if not ids or not answer:
-        raise ValueError(f"Case {name} requires nonempty prompt and reference token IDs")
+    if not ids:
+        raise ValueError("Chat template produced no prompt token IDs")
+    return ids
+
+
+def generate_tokens(model, tokenizer, ids, max_new_tokens, device):
+    import torch
+
     with torch.inference_mode():
         prefix = torch.tensor([ids], device=device)
         generated = model.generate(
@@ -68,6 +75,19 @@ def run_case(model, tokenizer, name, prompt, reference, max_new_tokens, device):
             num_beams=1,
             pad_token_id=tokenizer.eos_token_id,
         )[0, len(ids):]
+    return generated.tolist()
+
+
+def run_case(model, tokenizer, name, prompt, reference, max_new_tokens, device):
+    """Decode one greedy continuation and score the fixed reference token by token."""
+    import torch
+
+    ids = encode_prompt(tokenizer, prompt)
+    answer = tokenizer.encode(reference, add_special_tokens=False)
+    if not answer:
+        raise ValueError(f"Case {name} requires nonempty reference token IDs")
+    generated = generate_tokens(model, tokenizer, ids, max_new_tokens, device)
+    with torch.inference_mode():
         target = torch.tensor([ids + answer], device=device)
         logits = model(
             input_ids=target, attention_mask=torch.ones_like(target), use_cache=False,
@@ -81,12 +101,12 @@ def run_case(model, tokenizer, name, prompt, reference, max_new_tokens, device):
         "case": name,
         "prompt_token_ids": ids,
         "reference_ids": answer,
-        "greedy_ids": generated.tolist(),
+        "greedy_ids": generated,
         "reference_token_nll": nll.tolist(),
     }
 
 
-def run_fixture(weights, tokenizer_path, fixture, device):
+def load_model(weights, tokenizer_path, device):
     import torch
     from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
 
@@ -102,7 +122,14 @@ def run_fixture(weights, tokenizer_path, fixture, device):
     )
     if info["missing_keys"] or info["mismatched_keys"]:
         raise ValueError("Incomplete language weights")
-    model.eval().to(device)
+    return model.eval().to(device), tokenizer
+
+
+def run_fixture(weights, tokenizer_path, fixture, device):
+    import torch
+
+    device = torch.device(device)
+    model, tokenizer = load_model(weights, tokenizer_path, device)
     return {
         "precision": "float32",
         "torch": torch.__version__,
@@ -122,13 +149,35 @@ def main(argv=None):
     parser.add_argument("--base", type=Path, required=True, help="Path to the base weights directory")
     parser.add_argument("--base-manifest-sha256", required=True, help="Digest used by forecast mode")
     parser.add_argument("--tokenizer", type=Path, required=True, help="Path to the pinned tokenizer directory")
-    parser.add_argument("--fixture", type=Path, required=True)
+    parser.add_argument("--fixture", type=Path)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--output", type=Path, help="New private JSON receipt path")
     mode.add_argument("--verify-only", action="store_true", help="Verify input files without loading the model")
+    mode.add_argument("--prompt-stdin", action="store_true", help="Read one prompt from stdin and write text to stdout")
+    parser.add_argument("--max-new-tokens", type=int, help="Token limit for --prompt-stdin (default: 128)")
     parser.add_argument("--device", choices=("cpu", "cuda:0"), default="cuda:0")
     args = parser.parse_args(argv)
 
+    if args.prompt_stdin:
+        if args.fixture is not None:
+            parser.error("--fixture belongs to fixture verification or scoring")
+        max_new_tokens = args.max_new_tokens if args.max_new_tokens is not None else 128
+        if max_new_tokens < 1:
+            parser.error("--max-new-tokens must be positive")
+        prompt = sys.stdin.read()
+        if not prompt.strip():
+            parser.error("--prompt-stdin requires a nonempty prompt")
+        verify_model_inputs(args.base, args.base_manifest_sha256, args.tokenizer)
+        model, tokenizer = load_model(args.base, args.tokenizer, args.device)
+        ids = encode_prompt(tokenizer, prompt)
+        generated = generate_tokens(model, tokenizer, ids, max_new_tokens, args.device)
+        print(tokenizer.decode(generated, skip_special_tokens=True))
+        return
+
+    if args.fixture is None:
+        parser.error("--fixture is required with --verify-only or --output")
+    if args.max_new_tokens is not None:
+        parser.error("--max-new-tokens belongs to --prompt-stdin")
     fixture = verify_inputs(args.base, args.base_manifest_sha256, args.tokenizer, args.fixture)
     receipt = {
         "base_revision": BASE_REVISION,

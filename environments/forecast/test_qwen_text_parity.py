@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 import json
+import sys
 from argparse import Namespace
 from pathlib import Path
 
@@ -100,3 +101,18 @@ def test_other_history_with_same_window_id(inputs):
     np.savez(inputs.history, window_id=["fixture"], history=np.ones((1, 24), dtype="float32"))
     with pytest.raises(ValueError, match="history"):
         parity.qualify(inputs)
+
+
+def test_forecast_cli_verifies_history_before_loading_the_checkpoint(inputs, monkeypatch, tmp_path):
+    from opentslm import forecast_inference
+
+    monkeypatch.setattr(sys, "argv", [
+        "forecast_inference", "--head", "direct", "--parity-history", "--data", str(inputs.history),
+        "--weights", str(tmp_path / "weights"), "--checkpoint", str(tmp_path / "absent"),
+        "--output", str(tmp_path / "unused.npz"),
+    ])
+    with pytest.raises(ValueError, match="Expected a published checkpoint"):
+        forecast_inference.main()
+    np.savez(inputs.history, window_id=["fixture"], history=np.ones((1, 24), dtype="float32"))
+    with pytest.raises(ValueError, match="Forecast history differs"):
+        forecast_inference.main()

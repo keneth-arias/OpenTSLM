@@ -93,9 +93,9 @@ printf '%s' '¿Qué significa una media móvil?' | python -m opentslm.qwen_text 
 
 ### Check language parity across forecast restoration
 
-Before fitting, freeze the deployed probe revision and run its text fixture twice in separate processes on the verified
-managed GPU. Save both receipts and their SHA-256 values in the run record before selecting
-a checkpoint. Use the same immutable trainer image, GPU model, precision, tokenizer and
+Before the first fit begins, freeze the deployed probe revision, run its text fixture twice
+in separate processes on the verified managed GPU, and approve and record both receipts and their
+SHA-256 values. A change to the probe requires new pre-fit baselines. Use the same immutable trainer image, GPU model, precision, tokenizer and
 template for the post-restore text run. With the selected checkpoint mounted read-only,
 run `opentslm.forecast_inference --head direct --parity-history` in two fresh workers
 or processes with the frozen single-window history. This option verifies the exact NPZ bytes used

@@ -19,8 +19,8 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from opentslm.forecast import FORECASTERS, MODEL_REVISION, task_loss
 from opentslm.forecast_checkpoint import finish_direct, point_to, publish, read_manifest, reconcile_direct_resume, recover, rotate_direct, selected_generation, sha256
-from opentslm import forecast_direct
-from opentslm.forecast_inputs import direct_cohorts, verify_weight_snapshot
+from opentslm import flamingo_forecast, forecast_direct
+from opentslm.forecast_inputs import direct_cohorts, verify_flamingo_binding, verify_weight_snapshot
 from opentslm.forecast_inference import JointInputs, add_lora, configure_device, forecast, forecast_batches, read_task_data, state_options, task_schema, verify_candidate_input
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.device_mesh import init_device_mesh
@@ -47,6 +47,9 @@ def arguments():
     p.add_argument("--schedule-steps", required=True, type=int)
     p.add_argument("--batch", type=int, default=4, help="Global batch size")
     p.add_argument("--mode", choices=("single", "ddp", "fsdp"), default="fsdp")
+    p.add_argument("--backbone", choices=("qwen", "flamingo"), default="qwen")
+    p.add_argument("--flamingo-binding", type=Path)
+    p.add_argument("--flamingo-binding-sha256")
     p.add_argument("--head", choices=tuple(FORECASTERS), default="direct")
     p.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
     p.add_argument("--seed", type=int, default=27)
@@ -72,6 +75,11 @@ def arguments():
     p.add_argument("--scaler", type=Path)
     p.add_argument("--input-view", choices=("first", "both"))
     args = p.parse_args()
+    if args.backbone == "flamingo":
+        if not all((args.direct_objective, args.flamingo_binding, args.flamingo_binding_sha256)):
+            p.error("Flamingo requires a matched direct objective and a pinned cohort binding")
+    elif args.flamingo_binding or args.flamingo_binding_sha256:
+        p.error("Flamingo bindings require --backbone flamingo")
     if bool(args.logical_run) != bool(args.direct_objective):
         p.error("Supply --logical-run and --direct-objective together")
     if args.direct_objective:
@@ -110,6 +118,8 @@ def arguments():
 
 def checkpoint_state(model, optimizer, lora):
     params, optim = get_state_dict(model, optimizer, options=state_options(lora))
+    if isinstance(model, flamingo_forecast.FlamingoForecaster):
+        params = model.adapter_state(params)
     return {"model": params, "optimizer": optim}
 
 
@@ -290,6 +300,8 @@ def stop_marked(path):
 
 
 def train(args, rank, world, device):
+    is_flamingo = args.backbone == "flamingo"
+    weights_digest = sha256(args.weights.parent / "SHA256SUMS")
     if args.task_schema or args.matched_point:
         verify_candidate_input(args.data, args.input_manifest, args.input_manifest_sha256, "fit", args.head, args.thresholds_sha256)
         if args.validation:
@@ -299,8 +311,14 @@ def train(args, rank, world, device):
         if (args.data != args.input_manifest.parent / "data.npz" or
                 args.validation != args.validation_manifest.parent / "data.npz"):
             raise ValueError("Cohort data must come from its pinned role directory")
+        cohort_weights = weights_digest
+        if is_flamingo:
+            cohort_weights = verify_flamingo_binding(
+                args.flamingo_binding, args.flamingo_binding_sha256, weights_digest,
+                args.input_manifest_sha256, args.validation_manifest_sha256,
+            )
         cohorts = direct_cohorts(args.input_manifest, args.input_manifest_sha256, args.validation_manifest,
-                                 args.validation_manifest_sha256, sha256(args.weights.parent / "SHA256SUMS"))
+                                 args.validation_manifest_sha256, cohort_weights)
         fit = cohorts[0]
         ids = fit["window_id"]
         history = torch.from_numpy(fit["history"]).float().unsqueeze(-1)
@@ -316,7 +334,7 @@ def train(args, rank, world, device):
     if batches < 1 or (cohorts and args.schedule_steps != batches):
         raise ValueError("Schedule does not match the available training batches")
     identity = {
-        "model": MODEL_REVISION,
+        "model": flamingo_forecast.MODEL_REVISION if is_flamingo else MODEL_REVISION,
         "batch": args.batch,
         "head": args.head,
         "data": sha256(args.data),
@@ -329,8 +347,11 @@ def train(args, rank, world, device):
         "seed": args.seed,
         "torch": str(torch.__version__),
         "trainer": os.environ.get("FORECAST_SOURCE_REVISION", sha256(Path(__file__))),
-        "weights": sha256(args.weights.parent / "SHA256SUMS"),
+        "weights": weights_digest,
     }
+    if is_flamingo:
+        identity.update(backbone="flamingo", binding_sha256=args.flamingo_binding_sha256,
+                        forecast_schema=flamingo_forecast.forecast_schema())
     if args.direct_objective:
         verify_weight_snapshot(args.weights, identity["weights"], strict=True)
         identity.update(direct_objective=args.direct_objective, logical_run=args.logical_run,
@@ -351,7 +372,7 @@ def train(args, rank, world, device):
     if rank == 0 and not args.resume and list(args.run_dir.glob("step-????????")):
         raise FileExistsError("Choose a new run directory or resume")
     torch.manual_seed(args.seed)
-    forecaster = FORECASTERS[args.head]
+    forecaster = flamingo_forecast.FlamingoForecaster if is_flamingo else FORECASTERS[args.head]
     dimensions = {"channels": 2, "targets": 2} if args.joint else {}
     stop_file = os.environ.get("EPISODE_STOP_FILE")
 
@@ -369,9 +390,11 @@ def train(args, rank, world, device):
     load_started = time.monotonic()
     model = forecaster.from_pretrained(checkpoint_path=str(args.weights), local_files_only=True, **dimensions)
     loaded_at = time.monotonic()
-    # The embedding table is unused with numerical soft prompts.
-    model.decoder.get_input_embeddings().requires_grad_(False)
-    adapters = add_lora(model) if args.lora else []
+    if is_flamingo:
+        adapters = model.add_lora()
+    else:
+        model.decoder.get_input_embeddings().requires_grad_(False)
+        adapters = add_lora(model) if args.lora else []
     if args.joint:
         identity["joint"] = args.joint.identity()
     if args.joint or args.direct_objective:

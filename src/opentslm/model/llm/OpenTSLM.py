@@ -2,13 +2,17 @@
 # SPDX-FileCopyrightText: 2025 This source file is part of the OpenTSLM open-source project.
 #
 # SPDX-License-Identifier: MIT
+from __future__ import annotations
+
 import torch
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 from enum import Enum
 from huggingface_hub import hf_hub_download
 
-from .OpenTSLMSP import OpenTSLMSP
-from .OpenTSLMFlamingo import OpenTSLMFlamingo
+if TYPE_CHECKING:
+    from .OpenTSLMSP import OpenTSLMSP
+    from .OpenTSLMFlamingo import OpenTSLMFlamingo
+    from .per_series import PerSeriesFlamingo
 
 
 class ModelType(Enum):
@@ -50,7 +54,13 @@ class OpenTSLM:
         device: Optional[str] = None,
         cache_dir: Optional[str] = None,
         enable_lora: Optional[bool] = False,
-    ) -> Union[OpenTSLMSP, OpenTSLMFlamingo]:
+        *,
+        backend: Optional[str] = None,
+        revision: Optional[str] = None,
+        dtype: Optional[torch.dtype] = None,
+        base_revision: Optional[str] = None,
+        verify_weights: bool = False,
+    ) -> Union[OpenTSLMSP, OpenTSLMFlamingo, PerSeriesFlamingo]:
         """
         Load a pretrained model from Hugging Face Hub.
 
@@ -59,6 +69,11 @@ class OpenTSLM:
             device: Device to load the model on (default: auto-detect)
             cache_dir: Directory to cache downloaded models (optional)
             enable_lora: Whether to enable LoRA (default: False)
+            backend: Use "per-series" for the Gemma per-series safetensors format.
+            revision: Hub revision of the checkpoint.
+            base_revision: Hub revision of the separate legacy Flamingo language backbone and tokenizer.
+            verify_weights: Verify that every legacy Flamingo parameter is present. Per-series loading is always strict.
+            dtype: Frozen language model dtype for the per-series backend.
 
         Returns:
             Union[OpenTSLMSP, OpenTSLMFlamingo]: The loaded model instance
@@ -69,8 +84,22 @@ class OpenTSLM:
             >>> response = model.eval_prompt(prompt)
         """
         device = cls._get_device(device)
+        if backend == "per-series":
+            from .per_series import PerSeriesFlamingo
+
+            if base_revision is not None:
+                raise ValueError("the per-series snapshot includes its own backbone")
+            if enable_lora:
+                raise ValueError("attach forecast adapters after loading the per-series base")
+            return PerSeriesFlamingo.from_pretrained(
+                repo_id, device=device, dtype=dtype or torch.float32, revision=revision, cache_dir=cache_dir
+            )
+        if backend is not None or dtype is not None:
+            raise ValueError("explicit backend and dtype are supported for backend='per-series'")
         model_type = cls._detect_model_type(repo_id)
-        checkpoint_path = cls._download_model_files(repo_id, cache_dir)
+        if model_type == ModelType.SP and (base_revision or verify_weights):
+            raise ValueError("base_revision and verify_weights apply to the legacy Flamingo backend")
+        checkpoint_path = cls._download_model_files(repo_id, cache_dir, revision)
         base_llm_id = cls._get_base_llm_id(repo_id)
 
         print(f"🚀 Loading {model_type.value.upper()} model...")
@@ -80,23 +109,32 @@ class OpenTSLM:
 
         # Instantiate model with fixed training parameters
         if model_type == ModelType.SP:
+            from .OpenTSLMSP import OpenTSLMSP
+
             # OpenTSLMSP uses default parameters from curriculum learning
             model = OpenTSLMSP(llm_id=base_llm_id, device=device)
             if enable_lora:
                 model.enable_lora()
         elif model_type == ModelType.FLAMINGO:
+            from .OpenTSLMFlamingo import OpenTSLMFlamingo
+
             # OpenTSLMFlamingo with fixed parameters from curriculum learning
             model = OpenTSLMFlamingo(
                 device=device,
                 llm_id=base_llm_id,
                 cross_attn_every_n_layers=1,
                 gradient_checkpointing=False,
+                base_revision=base_revision,
+                cache_dir=cache_dir,
             )
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
         # Load the checkpoint
-        model.load_from_file(checkpoint_path)
+        if model_type == ModelType.FLAMINGO:
+            model.load_from_file(checkpoint_path, verify_weights=verify_weights)
+        else:
+            model.load_from_file(checkpoint_path)
         model.eval()
 
         print(f"✅ {model_type.value.upper()} model loaded successfully!")
@@ -129,13 +167,14 @@ class OpenTSLM:
             )
 
     @staticmethod
-    def _download_model_files(repo_id: str, cache_dir: Optional[str] = None) -> str:
+    def _download_model_files(repo_id: str, cache_dir: Optional[str] = None, revision: Optional[str] = None) -> str:
         """Download model checkpoint from Hugging Face Hub."""
         try:
             # Download the main model checkpoint file
             checkpoint_path = hf_hub_download(
                 repo_id=repo_id,
                 filename="model_checkpoint.pt",
+                revision=revision,
                 cache_dir=cache_dir,
                 local_files_only=False,
             )

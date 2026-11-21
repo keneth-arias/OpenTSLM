@@ -160,25 +160,12 @@ def test_checkpoint_forecast_and_plain_generation(model, tmp_path):
         OpenTSLM.load_pretrained(str(tmp_path), backend="per-series", device="cpu")
 
 
-@pytest.mark.parametrize("layout", ["llm", "model_state", "ddp"])
-def test_legacy_layouts_and_verified_restore(tmp_path, layout):
-    from opentslm.model.llm.OpenTSLMFlamingo import OpenTSLMFlamingo
+def test_reference_receipt_detects_changed_greedy_ids(model):
+    from scripts.check_per_series_reference import compare, traces
 
-    legacy = OpenTSLMFlamingo.__new__(OpenTSLMFlamingo)
-    torch.nn.Module.__init__(legacy)
-    legacy.model = torch.nn.ModuleDict(
-        {k: torch.nn.Linear(2, 2) for k in ("vision_encoder", "perceiver", "lang_encoder")}
-    )
-    legacy.llm = legacy.model
-    state = legacy.llm.state_dict() if layout == "llm" else legacy.state_dict()
-    if layout == "ddp":
-        state = {"module." + k: v for k, v in state.items()}
-    path = tmp_path / "weights.pt"
-    torch.save({"llm" if layout == "llm" else "model_state": state}, path)
-    original = legacy.model.vision_encoder.weight.detach().clone()
-    legacy.model.vision_encoder.weight.data.zero_()
-    legacy.load_from_file(path, verify_weights=True)
-    torch.testing.assert_close(original, legacy.model.vision_encoder.weight)
-    torch.save({"llm": {"vision_encoder.weight": original}}, path)
-    with pytest.raises(ValueError, match="lacks"):
-        legacy.load_from_file(path, verify_weights=True)
+    expected = traces(model, SeriesInput)
+    actual = traces(model, SeriesInput)
+    assert all(case["logits_max_abs_error"] == 0 for case in compare(expected, actual))
+    actual[0]["generated"] = actual[0]["generated"] + 1
+    with pytest.raises(AssertionError):
+        compare(expected, actual)

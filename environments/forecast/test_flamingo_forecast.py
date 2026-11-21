@@ -98,3 +98,15 @@ def test_role_binding_rejects_swaps_and_qwen_snapshot(tmp_path):
     for weights, first, second in ((ff.WEIGHTS_MANIFEST_SHA256, inner, fit), (original, fit, inner)):
         with pytest.raises(ValueError, match="binding"):
             verify_flamingo_binding(path, sha256(path), weights, first, second)
+
+
+def test_frozen_digest_distinguishes_adapter_and_base_mutations():
+    model = ff.FlamingoForecaster(ToyBackbone())
+    model.add_lora()
+    before = model.frozen_digest()
+    with torch.no_grad():
+        model.head.bias.add_(2)
+    assert model.frozen_digest() == before
+    with torch.no_grad():
+        model.decoder.layers[0].decoder_layer.self_attn.q_proj.base_layer.weight.add_(2)
+    assert model.frozen_digest() != before

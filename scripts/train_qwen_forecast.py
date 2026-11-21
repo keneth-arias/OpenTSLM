@@ -392,6 +392,12 @@ def train(args, rank, world, device):
     loaded_at = time.monotonic()
     if is_flamingo:
         adapters = model.add_lora()
+        trainable = [param for param in model.parameters() if param.requires_grad]
+        identity.update(
+            frozen_parameters_sha256=model.frozen_digest(),
+            trainable_parameters=sum(param.numel() for param in trainable),
+            trainable_bytes=sum(param.numel() * param.element_size() for param in trainable),
+        )
     else:
         model.decoder.get_input_embeddings().requires_grad_(False)
         adapters = add_lora(model) if args.lora else []
@@ -523,6 +529,8 @@ def train(args, rank, world, device):
                 best = metric if best is None else min(best, metric)
             if cohorts and step == evaluations[-1]["next_eval_step"]:
                 evaluate_pair(step)
+            if is_flamingo and model.frozen_digest() != identity["frozen_parameters_sha256"]:
+                raise ValueError("Frozen Flamingo parameters changed before checkpoint publication")
             save(args.run_dir, model, optimizer, scheduler, step, identity, rank, best, metric,
                  evaluations if cohorts else None)
             if cohorts and evaluations[-1]["outcome"] != "running":

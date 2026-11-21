@@ -40,6 +40,7 @@ def test_selected_forecast_roundtrip(model, tmp_path, monkeypatch):
         model=ff.MODEL_REVISION,
         backbone="flamingo",
         weights=ff.WEIGHTS_MANIFEST_SHA256,
+        frozen_parameters_sha256=wrapped.frozen_digest(),
         precision="fp32",
         head="direct",
         lora=True,

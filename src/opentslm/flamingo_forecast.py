@@ -4,6 +4,7 @@
 
 from contextlib import contextmanager
 import hashlib
+import json
 
 import torch
 from torch import nn
@@ -67,6 +68,18 @@ class FlamingoForecaster(nn.Module):
             raise ValueError("Unexpected Flamingo LoRA trainable parameters")
         return sorted(name for name in actual if ".lora_B." in name)
 
+    def frozen_digest(self):
+        """Digest named frozen weights, including aliases, with bounded host memory."""
+        digest = hashlib.sha256()
+        for name, param in self.named_parameters(remove_duplicate=False):
+            if param.requires_grad:
+                continue
+            header = [name, list(param.shape), str(param.dtype)]
+            digest.update(json.dumps(header, separators=(",", ":")).encode() + b"\n")
+            for part in param.detach().view(-1).split(2**22):
+                digest.update(memoryview(part.cpu().numpy()).cast("B"))
+        return digest.hexdigest()
+
     def adapter_state(self, state):
         # DCP can retain frozen alias keys for tied Flamingo modules. Save only the
         # unique trainable tensors, and fail if DCP lost one of the required adapters.
@@ -107,7 +120,6 @@ def verify_base(weights):
 
 def restore_selected(weights_dir, checkpoint_dir, receipt_path, *, expected_receipt_sha256, device="cpu"):
     """Restore only the selected adapter from a fingerprinted terminal direct-fit receipt."""
-    import json
     from pathlib import Path
     from .forecast_checkpoint import files, read_manifest, sha256
     from .forecast_inference import checkpoint_head, load_checkpoint_model
@@ -135,4 +147,6 @@ def restore_selected(weights_dir, checkpoint_dir, receipt_path, *, expected_rece
     model = FlamingoForecaster.from_pretrained(checkpoint_path=weights, local_files_only=True)
     model.add_lora()
     load_checkpoint_model(model, checkpoint, True)
+    if model.frozen_digest() != identity.get("frozen_parameters_sha256"):
+        raise ValueError("Restored frozen parameters differ from the training base")
     return model.to(device).eval()

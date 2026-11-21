@@ -65,3 +65,58 @@ Use `--direct-objective normalized-mse` for the control and `--direct-objective 
 The trainer evaluates the frozen fit sample and inner-validation set at initialization, every 500 updates and at the ceiling. The first eligible checkpoint is at update 500. A decrease in global validation MAE of at least 0.02 µg/m³ updates the selected checkpoint. Four consecutive checks without that decrease stop the fit. Read `direct-result.json` for the actual and selected steps, outcome and both checkpoint digests. `--resume` recovers the most recent complete compatible generation, repairs the selection pointer from its persisted history, and verifies any existing terminal result.
 
 For cooperative shutdown the supervisor sets `EPISODE_STOP_FILE` to an empty, attempt-specific file before starting the trainer. Writing a byte or removing the armed file requests a stop at the next safe point. Before any update, the trainer emits `stopped_before_update`. After saving an interrupted update, it emits `interrupted_at_step` for the supervisor.
+
+## Verify Qwen text mode
+
+The trainer image includes `opentslm.qwen_text`. Mount the shared Qwen base and its sibling `SHA256SUMS`, the pinned tokenizer directory, and the frozen bilingual fixture read-only. The fixture and its reference receipts are kept with the private experiment artifacts. The entry point verifies the base against the same weights manifest used by forecast mode and checks the tokenizer and chat template against the pinned Qwen revision.
+
+Run the following command in the trainer image for CPU input verification.
+
+```sh
+PYTHONPATH=/opt/forecast/src /opt/conda/bin/python -m opentslm.qwen_text \
+  --base /base/weights \
+  --base-manifest-sha256 1d76cc3cfd4c15f9c749372611e5ca6e0b6f910b1fcf0551ce9157e9bfef29c1 \
+  --tokenizer /tokenizer --fixture /fixture.json --verify-only
+```
+
+For a language receipt, replace `--verify-only` with `--output /result/receipt.json --device cuda:0` in the managed GPU workload. Use the same image, GPU type and precision for duplicate base runs and both sides of the text → forecast → text check. The receipt records prompt, greedy continuation and fixed reference token IDs plus causal negative log likelihood for every reference token. Text mode loads the Qwen generation model in FP32, uses the pinned chat template with thinking disabled, and leaves forecast adapter loading to `opentslm.forecast_inference` in its own process.
+
+For an ordinary text request, pipe one prompt to the same verified base and tokenizer.
+The command writes the greedy answer to standard output. It runs in a fresh process with
+the language head active and the forecast adapter unloaded.
+
+```bash
+printf '%s' '¿Qué significa una media móvil?' | python -m opentslm.qwen_text \
+  --base "$weights" --base-manifest-sha256 "$base_manifest_sha" --tokenizer "$tokenizer" \
+  --prompt-stdin --max-new-tokens 128
+```
+
+### Check language parity across forecast restoration
+
+Before the first fit begins, freeze the deployed probe revision, run its text fixture twice
+in separate processes on the verified managed GPU, and approve and record both receipts and their
+SHA-256 values. A change to the probe requires new pre-fit baselines. Use the same immutable trainer image, GPU model, precision, tokenizer and
+template for the post-restore text run. With the selected checkpoint mounted read-only,
+run `opentslm.forecast_inference --head direct --parity-history` in two fresh workers
+or processes with the frozen single-window history. This option verifies the exact NPZ bytes used
+for inference and includes their digest in each prediction file. Record each worker or process and the
+input and output digests. Then run the text fixture again in a fresh process. Keep receipts
+and predictions in private run storage.
+
+Run this comparison for each selected candidate. Supply the approved **pre-fit** receipt
+hashes and the independently recorded hash of the selected checkpoint's `manifest.json`.
+
+```bash
+python -m opentslm.qwen_text_parity \
+  --fixture "$fixture" --history "$history" \
+  --base "$base_receipt" --repeat "$repeat_receipt" --after "$restored_text" \
+  --approved-baselines "$approved_base_sha" "$approved_repeat_sha" \
+  --forecasts "$first_predictions" "$second_predictions" \
+  --checkpoint-sha256 "$selected_manifest_sha"
+```
+
+The command checks the frozen inputs, runtime identity, exact token IDs, and maximum absolute
+per-token loss difference measured between the two base runs. It also checks the window,
+selected checkpoint, all six horizons and identical finite FP32 predictions. On success it
+prints a JSON summary with artifact hashes. Keep the managed job IDs and chronology with
+that summary to establish where and when the separate runs took place.
